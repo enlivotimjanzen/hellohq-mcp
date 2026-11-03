@@ -1,6 +1,6 @@
 // helloHQ MCP-Server v2.2
 // Neu in 2.2: API v2 lesen und schreiben (eigene Systemadresse, Token pro Person, hinter Schaltern), Auswertungen,
-//             Zeitbuchungen in v1, Rollen per ROLE_DEFS_JSON erweiterbar.
+//             Rollen per ROLE_DEFS_JSON erweiterbar. Keine Zeitbuchungen: Zeiten kommen aus awork.
 // Neu in 2.1: Schreibwerkzeug für v1 im OAuth-Modus (feste Aktionen, Vorschau, Bestätigung, Protokoll). Kein Löschen.
 // Zwei Zugänge nebeneinander:
 //  1) Alt (Legacy): POST /mcp/<MCP_SECRET> mit gemeinsamem Token (wie v1.1), läuft unverändert weiter.
@@ -40,7 +40,7 @@ const {
   ENABLE_WRITE_V2 = "false",
 } = process.env;
 
-const VERSION = "2.2.0";
+const VERSION = "2.2.1";
 
 const LEGACY_ON = Boolean(HELLOHQ_API_TOKEN) && Boolean(MCP_SECRET) && MCP_SECRET.length >= 24;
 const OAUTH_ON =
@@ -457,10 +457,6 @@ const CONT = { FirstName: S, LastName: S, Position: S, CompanyId: I, PhoneLandli
 const LEAD = { Name: S, Number: S, Currency: S, StatusId: I, ClosingProbability: I, CompanyId: I, ResponsibleUserId: I, ProjectId: I, CashOn: DT, Volume: N };
 const PROJ_NEW = { ProjectTemplateId: I, Name: S, Number: S, CompanyId: I, ContactPersonId: I, ResponsibleUserId: I, LeadId: I, StartDate: DT, EndDate: DT, ProjectStatusId: I };
 const PROJ_STATUS = { ProjectStatusId: I };
-// Zeitbuchung: UserId ist kein Feld, sondern immer die angemeldete Person
-const REPORT_NEW = { TaskId: I, StartDate: DT, Duration: N, Description: S };
-const REPORT_EDIT = { Note: S, StartOn: DT, Duration: I, BreakDuration: I, TaskId: I };
-const REPORT_KEEP = [...Object.keys(REPORT_EDIT), "UserId", "ProjectId", "IsApproved"];
 
 // merge=true: Ändern liest zuerst den aktuellen Datensatz, legt die Änderungen darüber und sendet alle erlaubten Felder
 // (bzw. alle Felder aus keep). So gehen keine Werte verloren, egal ob PUT in helloHQ ersetzt oder ergänzt.
@@ -478,8 +474,6 @@ const SPECS = {
   lead_aendern: { label: "Lead ändern", res: "Leads", method: "PUT", path: (id) => `/v1/Leads(${id})`, fields: LEAD, merge: true, needId: true },
   projekt_anlegen: { label: "Projekt anlegen", res: "Projects", method: "POST", path: () => "/v1/Projects/do.Create", fields: PROJ_NEW, required: ["ProjectTemplateId", "Name"] },
   projekt_status_aendern: { label: "Projektstatus ändern", res: "Projects", method: "POST", path: (id) => `/v1/Projects(${id})/do.ChangeStatus`, fields: PROJ_STATUS, required: ["ProjectStatusId"], needId: true },
-  zeit_buchen: { label: "Zeit buchen (für dich)", res: "UserReportings", method: "POST", path: (id) => `/v1/Projects(${id})/do.CreateReporting`, fields: REPORT_NEW, required: ["StartDate", "Duration"], needId: true, defaults: (s) => ({ UserId: s.uid }) },
-  zeit_aendern: { label: "Eigene Zeitbuchung ändern", res: "UserReportings", method: "PUT", path: (id, _aid, s) => `/v1/Users(${s.uid})/Reportings(${id})`, fields: REPORT_EDIT, keep: REPORT_KEEP, merge: true, needId: true },
 };
 
 // v2: Belege nur als Entwurf. Kein Statuswechsel, kein Versand, keine Zahlungen, kein Löschen.
@@ -520,11 +514,9 @@ function cleanValue(field, type, v) {
     case I:
       if (!Number.isInteger(v)) throw bad("ganze Zahl erwartet");
       if (field === "ClosingProbability" && (v < 0 || v > 100)) throw bad("0 bis 100 erwartet");
-      if (/Duration$/.test(field) && (v < 0 || v > 86400)) throw bad("0 bis 86400 Sekunden erwartet");
       return v;
     case N:
       if (typeof v !== "number" || !Number.isFinite(v)) throw bad("Zahl erwartet");
-      if (field === "Duration" && (v <= 0 || v > 86400)) throw bad("Dauer größer 0 erwartet");
       return v;
     case B:
       if (typeof v !== "boolean") throw bad("wahr oder falsch erwartet");
@@ -1105,8 +1097,7 @@ function buildOAuthServer(session, role) {
         "Für alle ...aendern Aktionen und adresse_anlegen ist id nötig (bei Adressen die Firmen-id, bei adresse_aendern zusätzlich adress_id). Texte werden als reiner Text gespeichert. " +
         "historie_anlegen: CompanyId und ContactPersonId sind Pflicht (Ansprechpartner mit hellohq_list auf ContactPersons nachsehen), ContactType zum Beispiel wie in vorhandenen Einträgen (E-Mail, Meeting), Person und Datum werden automatisch gesetzt. " +
         "projekt_anlegen braucht eine ProjectTemplateId (mit hellohq_list auf ProjectTemplates nachsehen). Die E-Mail eines Ansprechpartners lässt sich in v1 nicht setzen (geht über hellohq_v2_schreiben). " +
-        "zeit_buchen: id ist die Projekt-id, StartDate Beginn, Duration Dauer in Stunden (z.B. 1.5), TaskId optional; gebucht wird immer für die angemeldete Person. " +
-        "zeit_aendern: id ist die Nummer der Buchung, nur eigene Buchungen, Duration und BreakDuration in Sekunden.",
+        "Zeiten werden nicht in helloHQ gebucht, sondern in awork (awork synchronisiert nach helloHQ, nicht umgekehrt).",
     });
   }
 
