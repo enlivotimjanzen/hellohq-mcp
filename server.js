@@ -40,7 +40,7 @@ const {
   ENABLE_WRITE_V2 = "false",
 } = process.env;
 
-const VERSION = "2.2.1";
+const VERSION = "2.3.0";
 
 const LEGACY_ON = Boolean(HELLOHQ_API_TOKEN) && Boolean(MCP_SECRET) && MCP_SECRET.length >= 24;
 const OAUTH_ON =
@@ -470,6 +470,8 @@ const SPECS = {
   adresse_aendern: { label: "Firmenadresse ändern", res: "Companies", method: "PUT", path: (id, aid) => `/v1/Companies(${id})/Addresses(${aid})`, fields: ADDR, merge: true, needId: true, needAddr: true },
   ansprechpartner_anlegen: { label: "Ansprechpartner anlegen", res: "ContactPersons", method: "POST", path: () => "/v1/ContactPersons", fields: CONT, required: ["LastName", "CompanyId"] },
   ansprechpartner_aendern: { label: "Ansprechpartner ändern", res: "ContactPersons", method: "PUT", path: (id) => `/v1/ContactPersons(${id})`, fields: CONT, merge: true, needId: true },
+  // v1 speichert die E-Mail eines Ansprechpartners in seiner Standardadresse (DefaultAddress.Email)
+  ansprechpartner_email: { label: "E-Mail eines Ansprechpartners setzen", res: "ContactPersons", method: "PUT", path: (id) => `/v1/ContactPersons(${id})`, fields: { Email: S }, required: ["Email"], merge: true, needId: true, nested: "DefaultAddress" },
   lead_anlegen: { label: "Lead anlegen", res: "Leads", method: "POST", path: () => "/v1/Leads", fields: LEAD, required: ["CompanyId"] },
   lead_aendern: { label: "Lead ändern", res: "Leads", method: "PUT", path: (id) => `/v1/Leads(${id})`, fields: LEAD, merge: true, needId: true },
   projekt_anlegen: { label: "Projekt anlegen", res: "Projects", method: "POST", path: () => "/v1/Projects/do.Create", fields: PROJ_NEW, required: ["ProjectTemplateId", "Name"] },
@@ -536,7 +538,7 @@ function cleanValue(field, type, v) {
     }
     default:
       if (typeof v !== "string" || v.length > 2000) throw bad("Text bis 2000 Zeichen erwartet");
-      if (field === "eMail" && v !== "" && !/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(v)) throw bad("gültige E-Mail-Adresse erwartet");
+      if ((field === "eMail" || field === "Email") && v !== "" && !/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(v)) throw bad("gültige E-Mail-Adresse erwartet");
       return v;
   }
 }
@@ -555,8 +557,8 @@ const stable = (o) =>
     v && typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : 1))) : v
   );
 
-async function fetchCurrent(path, api) {
-  const { text } = await hqRequest("GET", path, { base: api.base, token: api.token });
+async function fetchCurrent(path, api, query) {
+  const { text } = await hqRequest("GET", path, { base: api.base, token: api.token, query });
   let j = JSON.parse(text);
   if (Array.isArray(j.value)) j = j.value[0];
   if (!j || typeof j !== "object") throw new Error("Datensatz nicht gefunden.");
@@ -570,8 +572,9 @@ async function prepareWrite(spec, session, { id, adress_id, daten }, api) {
   const path = spec.path(id, adress_id, session);
   if (spec.merge) {
     if (!Object.keys(data).length) throw new Error("Keine Änderungen angegeben (daten ist leer).");
-    const cur = await fetchCurrent(path, api);
+    const cur = await fetchCurrent(path, api, spec.nested ? { $expand: spec.nested } : undefined);
     if (spec.check) await spec.check(cur, api);
+    if (spec.nested) return prepareNested(spec, cur, data, path, id);
     const changes = Object.entries(data).filter(([k, v]) => cur[k] !== v).map(([k, v]) => ({ feld: k, alt: cur[k] ?? null, neu: v }));
     if (!changes.length) return { noChange: true };
     const body = {};
@@ -583,6 +586,31 @@ async function prepareWrite(spec, session, { id, adress_id, daten }, api) {
   const body = { ...(spec.defaults ? spec.defaults(session) : {}), ...data };
   for (const r of spec.required || []) if (body[r] === undefined || body[r] === "") throw new Error(`Pflichtfeld fehlt: ${r}`);
   return { method: spec.method, path, body: spec.toBody ? spec.toBody(body) : body, preview: { neue_daten: body } };
+}
+
+// Änderung in einem eingebetteten Datensatz (z.B. DefaultAddress): Hauptfelder bleiben, nur die angegebenen Felder darunter ändern sich
+function prepareNested(spec, cur, data, path, id) {
+  const sub = cur[spec.nested];
+  if (!sub || typeof sub !== "object" || !Number.isInteger(sub.Id)) throw new Error("Dieser Ansprechpartner hat keine Standardadresse. Die E-Mail bitte einmal in helloHQ von Hand eintragen.");
+  const changes = Object.entries(data).filter(([k, v]) => String(sub[k] ?? "").trim() !== v).map(([k, v]) => ({ feld: k, alt: sub[k] ?? null, neu: v }));
+  if (!changes.length) return { noChange: true };
+  const body = { Id: id, DefaultAddressId: sub.Id };
+  for (const k of Object.keys(CONT)) if (cur[k] !== undefined && cur[k] !== null) body[k] = cur[k];
+  const { CreatedBy, UpdatedBy, CreatedOn, UpdatedOn, ...rest } = sub;
+  body[spec.nested] = { ...rest, ...data };
+  return { method: spec.method, path, body, preview: { ansprechpartner: [cur.FirstName, cur.LastName].filter(Boolean).join(" "), aenderungen: changes }, verify: data };
+}
+
+// Nach dem Schreiben nachlesen, ob helloHQ die Werte im eingebetteten Datensatz übernommen hat
+async function verifyNested(spec, p, api) {
+  try {
+    const now = await fetchCurrent(p.path, api, { $expand: spec.nested });
+    const sub = now[spec.nested] || {};
+    const ok = Object.entries(p.verify).every(([k, v]) => String(sub[k] ?? "").trim() === v);
+    return { geprueft: ok ? "Wert in helloHQ gespeichert" : "ACHTUNG: helloHQ hat den Wert nicht übernommen, bitte in helloHQ prüfen" };
+  } catch (e) {
+    return { geprueft: "Nachlesen fehlgeschlagen: " + String(e.message || e).slice(0, 120) };
+  }
 }
 
 // Sichtbarer Vermerk am neuen Beleg, wer ihn über Claude angelegt hat. Ein Fehler hier macht das Anlegen nicht rückgängig.
@@ -661,7 +689,7 @@ function registerWriteTool(server, { name, title, specs, api, session, role, hin
         }
         if (!markCodeUsed(vorschau_code)) throw new Error("Diese Vorschau wurde bereits verwendet. Bitte eine neue Vorschau erzeugen.");
         const { status, text } = await hqRequest(p.method, p.path, { base: api.base, token: api.token, body: p.body });
-        const extra = spec.vermerk ? await addVermerk(text, session, api) : {};
+        const extra = spec.vermerk ? await addVermerk(text, session, api) : spec.nested ? await verifyNested(spec, p, api) : {};
         auditWrite({ ...log, status, felder: Object.keys(data), ...extra });
         if (!Object.keys(extra).length) return asResult(text || JSON.stringify({ ok: true, status }));
         let ergebnis = text;
@@ -1096,7 +1124,7 @@ function buildOAuthServer(session, role) {
         "Änderungen erscheinen in helloHQ unter dem Namen der angemeldeten Person. " +
         "Für alle ...aendern Aktionen und adresse_anlegen ist id nötig (bei Adressen die Firmen-id, bei adresse_aendern zusätzlich adress_id). Texte werden als reiner Text gespeichert. " +
         "historie_anlegen: CompanyId und ContactPersonId sind Pflicht (Ansprechpartner mit hellohq_list auf ContactPersons nachsehen), ContactType zum Beispiel wie in vorhandenen Einträgen (E-Mail, Meeting), Person und Datum werden automatisch gesetzt. " +
-        "projekt_anlegen braucht eine ProjectTemplateId (mit hellohq_list auf ProjectTemplates nachsehen). Die E-Mail eines Ansprechpartners lässt sich in v1 nicht setzen (geht über hellohq_v2_schreiben). " +
+        "projekt_anlegen braucht eine ProjectTemplateId (mit hellohq_list auf ProjectTemplates nachsehen). Die E-Mail eines Ansprechpartners setzt du mit ansprechpartner_email (id des Ansprechpartners, daten {\"Email\":\"name@firma.de\"}); bei neuen Ansprechpartnern zuerst ansprechpartner_anlegen, dann ansprechpartner_email. " +
         "Zeiten werden nicht in helloHQ gebucht, sondern in awork (awork synchronisiert nach helloHQ, nicht umgekehrt).",
     });
   }
