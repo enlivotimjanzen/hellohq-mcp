@@ -40,7 +40,7 @@ const {
   ENABLE_WRITE_V2 = "false",
 } = process.env;
 
-const VERSION = "2.3.0";
+const VERSION = "2.4.0";
 
 const LEGACY_ON = Boolean(HELLOHQ_API_TOKEN) && Boolean(MCP_SECRET) && MCP_SECRET.length >= 24;
 const OAUTH_ON =
@@ -471,7 +471,9 @@ const SPECS = {
   ansprechpartner_anlegen: { label: "Ansprechpartner anlegen", res: "ContactPersons", method: "POST", path: () => "/v1/ContactPersons", fields: CONT, required: ["LastName", "CompanyId"] },
   ansprechpartner_aendern: { label: "Ansprechpartner ändern", res: "ContactPersons", method: "PUT", path: (id) => `/v1/ContactPersons(${id})`, fields: CONT, merge: true, needId: true },
   // v1 speichert die E-Mail eines Ansprechpartners in seiner Standardadresse (DefaultAddress.Email)
-  ansprechpartner_email: { label: "E-Mail eines Ansprechpartners setzen", res: "ContactPersons", method: "PUT", path: (id) => `/v1/ContactPersons(${id})`, fields: { Email: S }, required: ["Email"], merge: true, needId: true, nested: "DefaultAddress" },
+  ansprechpartner_email: { label: "E-Mail eines Ansprechpartners setzen", res: "ContactPersons", method: "PUT", path: (id) => `/v1/ContactPersons(${id})`, fields: { Email: S }, required: ["Email"], merge: true, needId: true, nested: "DefaultAddress", build: buildEmail, saved: (now, d) => String(now.DefaultAddress?.Email ?? "").trim() === d.Email },
+  // v1 hat keinen dokumentierten Weg für Firmentypen; die Typen werden beim PUT der Firma mitgeschickt. Nur hinzufügen, nie entfernen.
+  firmentyp_hinzufuegen: { label: "Firmentyp hinzufügen", res: "Companies", method: "PUT", path: (id) => `/v1/Companies(${id})`, fields: { CompanyTypeIds: IDS }, required: ["CompanyTypeIds"], merge: true, needId: true, nested: "CompanyTypes", build: buildTypes, saved: (now, d) => d.CompanyTypeIds.every((t) => (now.CompanyTypes || []).some((c) => c.Id === t)) },
   lead_anlegen: { label: "Lead anlegen", res: "Leads", method: "POST", path: () => "/v1/Leads", fields: LEAD, required: ["CompanyId"] },
   lead_aendern: { label: "Lead ändern", res: "Leads", method: "PUT", path: (id) => `/v1/Leads(${id})`, fields: LEAD, merge: true, needId: true },
   projekt_anlegen: { label: "Projekt anlegen", res: "Projects", method: "POST", path: () => "/v1/Projects/do.Create", fields: PROJ_NEW, required: ["ProjectTemplateId", "Name"] },
@@ -574,7 +576,7 @@ async function prepareWrite(spec, session, { id, adress_id, daten }, api) {
     if (!Object.keys(data).length) throw new Error("Keine Änderungen angegeben (daten ist leer).");
     const cur = await fetchCurrent(path, api, spec.nested ? { $expand: spec.nested } : undefined);
     if (spec.check) await spec.check(cur, api);
-    if (spec.nested) return prepareNested(spec, cur, data, path, id);
+    if (spec.nested) return prepareNested(spec, cur, data, path, id, api);
     const changes = Object.entries(data).filter(([k, v]) => cur[k] !== v).map(([k, v]) => ({ feld: k, alt: cur[k] ?? null, neu: v }));
     if (!changes.length) return { noChange: true };
     const body = {};
@@ -588,26 +590,61 @@ async function prepareWrite(spec, session, { id, adress_id, daten }, api) {
   return { method: spec.method, path, body: spec.toBody ? spec.toBody(body) : body, preview: { neue_daten: body } };
 }
 
-// Änderung in einem eingebetteten Datensatz (z.B. DefaultAddress): Hauptfelder bleiben, nur die angegebenen Felder darunter ändern sich
-function prepareNested(spec, cur, data, path, id) {
-  const sub = cur[spec.nested];
+// Änderung in eingebetteten Daten (z.B. DefaultAddress, CompanyTypes): spec.build liefert Änderungen und Teil-Body,
+// die Grunddaten des Datensatzes werden unverändert mitgeschickt
+const SYS = ["CreatedBy", "UpdatedBy", "CreatedOn", "UpdatedOn"];
+const noSys = (o) => Object.fromEntries(Object.entries(o).filter(([k]) => !SYS.includes(k)));
+
+function buildEmail(cur, data) {
+  const sub = cur.DefaultAddress;
   if (!sub || typeof sub !== "object" || !Number.isInteger(sub.Id)) throw new Error("Dieser Ansprechpartner hat keine Standardadresse. Die E-Mail bitte einmal in helloHQ von Hand eintragen.");
-  const changes = Object.entries(data).filter(([k, v]) => String(sub[k] ?? "").trim() !== v).map(([k, v]) => ({ feld: k, alt: sub[k] ?? null, neu: v }));
-  if (!changes.length) return { noChange: true };
-  const body = { Id: id, DefaultAddressId: sub.Id };
-  for (const k of Object.keys(CONT)) if (cur[k] !== undefined && cur[k] !== null) body[k] = cur[k];
-  const { CreatedBy, UpdatedBy, CreatedOn, UpdatedOn, ...rest } = sub;
-  body[spec.nested] = { ...rest, ...data };
-  return { method: spec.method, path, body, preview: { ansprechpartner: [cur.FirstName, cur.LastName].filter(Boolean).join(" "), aenderungen: changes }, verify: data };
+  const alt = String(sub.Email ?? "").trim();
+  if (alt === data.Email) return null;
+  return {
+    preview: { ansprechpartner: [cur.FirstName, cur.LastName].filter(Boolean).join(" "), aenderungen: [{ feld: "Email", alt: sub.Email ?? null, neu: data.Email }] },
+    extra: { DefaultAddressId: sub.Id, DefaultAddress: { ...noSys(sub), Email: data.Email } },
+    base: CONT,
+  };
 }
 
-// Nach dem Schreiben nachlesen, ob helloHQ die Werte im eingebetteten Datensatz übernommen hat
+let typeCache = null;
+async function companyTypes(api) {
+  if (!typeCache || typeCache.t < Date.now() - 600000) {
+    const { text } = await hqRequest("GET", "/v1/CompanyTypes", { base: api.base, token: api.token });
+    typeCache = { t: Date.now(), list: (JSON.parse(text).value || []).map((c) => ({ Id: c.Id, Name: c.Name })) };
+  }
+  return typeCache.list;
+}
+
+async function buildTypes(cur, data, api) {
+  const all = await companyTypes(api);
+  const unknown = data.CompanyTypeIds.filter((t) => !all.some((c) => c.Id === t));
+  if (unknown.length) throw new Error(`Unbekannter Firmentyp ${unknown.join(", ")}. Vorhanden: ${all.map((c) => `${c.Name} (${c.Id})`).join(", ")}`);
+  const has = (cur.CompanyTypes || []).map((c) => c.Id);
+  const add = data.CompanyTypeIds.filter((t) => !has.includes(t));
+  if (!add.length) return null;
+  const name = (id) => all.find((c) => c.Id === id)?.Name ?? String(id);
+  return {
+    preview: { firma: cur.Name, aenderungen: [{ feld: "Firmentypen", alt: has.map(name), neu: [...has, ...add].map(name) }] },
+    extra: { CompanyTypes: [...(cur.CompanyTypes || []).map(noSys), ...add.map((Id) => ({ Id, Name: name(Id), CompanyId: cur.Id }))] },
+    base: COMP,
+  };
+}
+
+async function prepareNested(spec, cur, data, path, id, api) {
+  const b = await spec.build(cur, data, api);
+  if (!b) return { noChange: true };
+  const body = { Id: id };
+  for (const k of Object.keys(b.base)) if (cur[k] !== undefined && cur[k] !== null) body[k] = cur[k];
+  Object.assign(body, b.extra);
+  return { method: spec.method, path, body, preview: b.preview, verify: data };
+}
+
+// Nach dem Schreiben nachlesen, ob helloHQ die eingebetteten Werte übernommen hat (Weg ist nicht dokumentiert)
 async function verifyNested(spec, p, api) {
   try {
     const now = await fetchCurrent(p.path, api, { $expand: spec.nested });
-    const sub = now[spec.nested] || {};
-    const ok = Object.entries(p.verify).every(([k, v]) => String(sub[k] ?? "").trim() === v);
-    return { geprueft: ok ? "Wert in helloHQ gespeichert" : "ACHTUNG: helloHQ hat den Wert nicht übernommen, bitte in helloHQ prüfen" };
+    return { geprueft: spec.saved(now, p.verify) ? "Wert in helloHQ gespeichert" : "ACHTUNG: helloHQ hat den Wert nicht übernommen, bitte in helloHQ prüfen" };
   } catch (e) {
     return { geprueft: "Nachlesen fehlgeschlagen: " + String(e.message || e).slice(0, 120) };
   }
@@ -1124,7 +1161,7 @@ function buildOAuthServer(session, role) {
         "Änderungen erscheinen in helloHQ unter dem Namen der angemeldeten Person. " +
         "Für alle ...aendern Aktionen und adresse_anlegen ist id nötig (bei Adressen die Firmen-id, bei adresse_aendern zusätzlich adress_id). Texte werden als reiner Text gespeichert. " +
         "historie_anlegen: CompanyId und ContactPersonId sind Pflicht (Ansprechpartner mit hellohq_list auf ContactPersons nachsehen), ContactType zum Beispiel wie in vorhandenen Einträgen (E-Mail, Meeting), Person und Datum werden automatisch gesetzt. " +
-        "projekt_anlegen braucht eine ProjectTemplateId (mit hellohq_list auf ProjectTemplates nachsehen). Die E-Mail eines Ansprechpartners setzt du mit ansprechpartner_email (id des Ansprechpartners, daten {\"Email\":\"name@firma.de\"}); bei neuen Ansprechpartnern zuerst ansprechpartner_anlegen, dann ansprechpartner_email. " +
+        "projekt_anlegen braucht eine ProjectTemplateId (mit hellohq_list auf ProjectTemplates nachsehen). Die E-Mail eines Ansprechpartners setzt du mit ansprechpartner_email (id des Ansprechpartners, daten {\"Email\":\"name@firma.de\"}); bei neuen Ansprechpartnern zuerst ansprechpartner_anlegen, dann ansprechpartner_email. Firmentypen (z.B. Interessent) setzt du mit firmentyp_hinzufuegen (id der Firma, daten {\"CompanyTypeIds\":\"4004\"}, Nummern mit hellohq_list auf CompanyTypes nachsehen); vorhandene Typen bleiben erhalten, entfernen geht nicht. Bei neuen Firmen zuerst firma_anlegen, dann firmentyp_hinzufuegen. Schreibe den Typ nicht als Vermerk in die Beschreibung. " +
         "Zeiten werden nicht in helloHQ gebucht, sondern in awork (awork synchronisiert nach helloHQ, nicht umgekehrt).",
     });
   }
