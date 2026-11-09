@@ -40,7 +40,7 @@ const {
   ENABLE_WRITE_V2 = "false",
 } = process.env;
 
-const VERSION = "2.4.0";
+const VERSION = "2.5.0";
 
 const LEGACY_ON = Boolean(HELLOHQ_API_TOKEN) && Boolean(MCP_SECRET) && MCP_SECRET.length >= 24;
 const OAUTH_ON =
@@ -496,13 +496,111 @@ async function requireDraft(cur, api) {
   if (st.documentStatusType !== "Draft") throw new Error(`Nur Entwürfe dürfen geändert werden. Dieser Beleg hat den Status "${st.name || st.documentStatusType}".`);
 }
 
+// Beleg über die Nummer lesen und prüfen, dass er ein Entwurf ist
+async function draftDoc(docId, api) {
+  const cur = await fetchCurrent(`/v2/Documents/${docId}`, api);
+  await requireDraft(cur, api);
+  return cur;
+}
+
+// Positionen hängen an einem Beleg (nur Entwurf) oder an einem geplanten Umsatz (nicht abgerechnet).
+// Ohne documentTableId nimmt der Server die erste Tabelle des Belegs.
+async function positionGuard({ data, api }) {
+  const docId = data.documentEntityId;
+  if (!Number.isInteger(docId)) throw new Error("Pflichtfeld fehlt: documentEntityId (Nummer des Belegs oder geplanten Umsatzes).");
+  let cur;
+  try {
+    cur = await draftDoc(docId, api);
+  } catch (e) {
+    if (!/ 404/.test(String(e.message))) throw e;
+    const pr = await fetchCurrent(`/v2/PlannedRevenues/${docId}`, api);
+    if (["Billed", "Declined"].includes(pr.status)) throw new Error(`Der geplante Umsatz hat den Status ${pr.status} und wird nicht mehr geändert.`);
+    cur = pr;
+  }
+  const table = (cur.orderedElements || []).find((e) => e.type === "Grid");
+  if (!data.documentTableId && !table) throw new Error("Keine Tabelle im Beleg gefunden. Bitte documentTableId angeben (hellohq_v2_get auf den Beleg, Element vom Typ Grid).");
+  return { set: table ? { documentTableId: table.id } : {}, info: { beleg: cur.number || "Entwurf ohne Nummer", beleg_id: docId, firma_id: cur.companyId ?? null } };
+}
+
+const INVOICE_TYPES = ["Invoice", "AdvancedInvoice", "FinalInvoice"];
+const PAY_TYPES = ["BankAccount", "DebitCharge", "CreditCard", "Cash", "EarlyPayment"];
+
+// Zahlung nur an versendeten Rechnungen und höchstens in Höhe des offenen Betrags
+async function paymentGuard({ id, data, api }) {
+  const cur = await fetchCurrent(`/v2/Documents/${id}`, api);
+  if (!INVOICE_TYPES.includes(cur.documentType)) throw new Error(`Zahlungen gehen nur an Rechnungen. Dieser Beleg ist vom Typ ${cur.documentType}.`);
+  const { text } = await hqRequest("GET", `/v2/DocumentStatus/${cur.documentStatusEntityId}`, { base: api.base, token: api.token });
+  const st = JSON.parse(text);
+  if (st.documentStatusType !== "Sent") throw new Error(`Zahlungen gehen nur an versendete Rechnungen. Diese Rechnung hat den Status "${st.name || st.documentStatusType}".`);
+  const brutto = Number(cur.grossValue) || 0;
+  const bezahlt = round2((cur.payments || []).reduce((sum, x) => sum + (Number(x.amount) || 0), 0));
+  const offen = round2(brutto - bezahlt);
+  if (!(data.amount > 0)) throw new Error("Feld \"amount\": Betrag größer 0 erwartet.");
+  if (data.amount > offen + 0.005) throw new Error(`Der Betrag ${data.amount} ist höher als der offene Betrag ${offen} ${cur.currency || "EUR"}.`);
+  return { info: { rechnung: cur.number, firma: cur.company?.name ?? cur.companyId, brutto, bereits_bezahlt: bezahlt, offen_vorher: offen, offen_nachher: round2(offen - data.amount), waehrung: cur.currency || "EUR" } };
+}
+
+// Nach der Zahlung den Status nachlesen
+async function afterPayment(_text, p, api) {
+  try {
+    const cur = await fetchCurrent(p.path.replace(/\/Payments$/, ""), api);
+    const { text } = await hqRequest("GET", `/v2/DocumentStatus/${cur.documentStatusEntityId}`, { base: api.base, token: api.token });
+    return { status_danach: JSON.parse(text).name };
+  } catch (e) {
+    return { status_danach: "nicht lesbar: " + String(e.message || e).slice(0, 120) };
+  }
+}
+
+async function sourceDocGuard({ id, api }) {
+  const cur = await fetchCurrent(`/v2/Documents/${id}`, api);
+  return { info: { quelle: cur.number || "Entwurf ohne Nummer", quelle_typ: cur.documentType, firma: cur.company?.name ?? cur.companyId, netto: cur.netValue } };
+}
+
+const POS_FREE = { documentEntityId: I, text: TXT, amount1: N, unitId1: I, price: N, tax: N, discountPercent: N, isOptional: B, performancePeriodStartDate: DT, performancePeriodEndDate: DT, documentTableId: S };
+const POS_PUT_KEEP = ["interval", "text", "amount1", "unitId1", "amount2", "unitId2", "price", "cost", "tax", "marginNet", "marginPercent", "discountNet", "discountPercent", "performancePeriodStartDate", "performancePeriodEndDate", "isExternal", "isFactorizable", "financesCostCenter1Id", "financesCostCenter2Id", "financesBookingAccountId", "projectId", "projectRoleId", "taskTypeId", "isOptional"];
+const POS_EDIT = { text: TXT, amount1: N, unitId1: I, price: N, tax: N, discountPercent: N, isOptional: B, performancePeriodStartDate: DT, performancePeriodEndDate: DT };
+const COMP_NEW_V2 = { name: S, industrialSector: S, description: S, homepage: S, vatId: S, companyTypeIds: IDS, responsibleUserIds: IDS, street: S, houseNumber: S, zipCode: S, city: S, country: S, addressEmail: S, addressPhone: S };
+const CONT_NEW_V2 = { companyId: I, firstName: S, lastName: S, position: S, phoneLandline: S, phoneMobile: S, eMail: S, salutation: S, salutationForm: ["Formal", "Informal", "Neutral"], note: S };
+const HIST_V2 = { companyId: I, contactPersonId: I, reason: S, content: TXT, contactOn: DT, contactHistoryChannel: ["Note", "Mail", "Call", "Meeting", "Visit", "Task"], contactHistoryStatus: ["Reached", "NotReached"], nextContactDate: DT, isReminder: B, responsibleUserIds: IDS, leadId: I, projectId: I };
+const LEAD_V2 = { name: S, companyId: I, contactPersonId: I, volume: N, cashOn: DT, currency: ["EUR", "CHF", "USD", "GBP"], probability: I, responsibleUserId: I, statusId: I, projectId: I };
+const INTERVALS = ["Once", "Annually", "HalfAnnually", "QuarterAnnually", "Monthly", "Weekly", "TwoYears", "ThreeYears", "FourYears", "FiveYears", "Fortnightly", "BiMonthly"];
+const PR_EDIT = { description: S, interval: INTERVALS, startDate: DT, endDate: DT, dueMonth: I, dueDay: I, performancePeriod: ["DueDateMonth", "MonthBeforeDueDate", "DueDateYear", "YearBeforeDueDate"], invoiceType: ["AdvancedInvoice", "Invoice", "FinalInvoice"], invoiceDate: ["InvoiceCreation", "DueDate", "LastDayOfPerformancePeriod", "LastDayOfMonthBeforeDueDate"], currency: ["EUR", "CHF", "USD", "GBP"], marginPercent: N, discountPercent: N, leadId: I, projectId: I };
+const PR_NEW = { ...PR_EDIT, companyId: I, documentType: ["PlannedRevenueStandard", "PlannedRevenueTimeAndMaterial"] };
+const PR_KEEP = [...Object.keys(PR_EDIT), "companyId"];
+const noBody = () => undefined;
+
+// team: true heißt, die Aktion steht allen Rollen aus WRITE_ROLES offen (CRM). Alle anderen nur WRITE_ROLES_V2 (finance, gf).
 const SPECS_V2 = {
+  // Belege (nur Entwürfe)
   beleg_entwurf_anlegen: { label: "Belegentwurf anlegen", res: "Documents", method: "POST", path: () => "/v2/Documents", fields: DOC_NEW, required: ["documentType", "companyId", "documentTemplateEntityId", "date", "validUntilDate", "performancePeriodStartDate", "performancePeriodEndDate", "currency"], defaults: () => ({ currency: "EUR", date: new Date().toISOString() }), vermerk: true },
   beleg_entwurf_aendern: { label: "Belegentwurf ändern", res: "Documents", method: "PUT", path: (id) => `/v2/Documents/${id}`, fields: DOC_EDIT, keep: DOC_KEEP, merge: true, needId: true, check: requireDraft },
+  beleg_aus_beleg: { label: "Neuen Entwurf aus einem Beleg erzeugen (z.B. Angebot zu Rechnung)", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/CreateFromDocument`, fields: { documentType: ["Quotation", "Confirmation", "Invoice", "AdvancedInvoice", "FinalInvoice", "DeliveryNote"] }, required: ["documentType"], needId: true, guard: sourceDocGuard, vermerk: true },
+  beleg_kopieren: { label: "Beleg als neuen Entwurf kopieren", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/Copy`, fields: {}, needId: true, guard: sourceDocGuard, toBody: noBody, vermerk: true },
+  beleg_vorlage_wechseln: { label: "Vorlage eines Entwurfs wechseln", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/ChangeTemplate`, fields: { documentTemplateId: I, replaceOrderedElementsFromTemplate: B }, required: ["documentTemplateId"], needId: true, defaults: () => ({ replaceOrderedElementsFromTemplate: false }), guard: ({ id, api }) => draftDoc(id, api).then((c) => ({ info: { beleg_id: id, vorlage_bisher: c.documentTemplateEntityId } })) },
   beleg_kommentar: { label: "Kommentar an Beleg", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/Comments`, fields: { message: TXT }, required: ["message"], needId: true, defaults: (s) => ({ userId: s.uid }) },
-  firmentypen_setzen: { label: "Firmentypen setzen (ersetzt die bisherigen)", res: "Companies", method: "POST", path: (id) => `/v2/Companies/${id}/UpdateCompanyTypes`, fields: { companyTypeIds: IDS }, required: ["companyTypeIds"], needId: true, toBody: (b) => b.companyTypeIds.map((companyTypeId) => ({ companyTypeId })) },
-  projekt_aendern: { label: "Projekt ändern", res: "Projects", method: "PUT", path: (id) => `/v2/Projects/${id}`, fields: PROJ_EDIT_V2, keep: ["name", "startDate", "companyId", "internalContactPersonId"], merge: true, needId: true },
-  ansprechpartner_aendern: { label: "Ansprechpartner ändern (auch E-Mail)", res: "ContactPersons", method: "PUT", path: (id) => `/v2/ContactPersons/${id}`, fields: CONT_EDIT_V2, keep: CONT_KEEP_V2, merge: true, needId: true },
+  // Positionen (Beleg im Entwurf oder geplanter Umsatz)
+  position_freitext: { label: "Freitext-Position mit Preis anlegen", res: "DocumentPositions", method: "POST", path: () => "/v2/DocumentPositions/FreeTextPosition", fields: POS_FREE, required: ["documentEntityId", "text", "amount1", "price"], defaults: () => ({ interval: "Once", tax: 19, cost: 0, marginNet: 0, marginPercent: 0, discountNet: 0, discountPercent: 0, isExternal: false, isFactorizable: false, isOptional: false }), guard: positionGuard },
+  position_leistung: { label: "Position aus dem Leistungskatalog anlegen", res: "DocumentPositions", method: "POST", path: () => "/v2/DocumentPositions/ServicePosition", fields: { documentEntityId: I, servicePriceId: I, documentTableId: S }, required: ["documentEntityId", "servicePriceId"], guard: positionGuard },
+  position_leistungsset: { label: "Leistungsset als Positionen anlegen", res: "DocumentPositions", method: "POST", path: () => "/v2/DocumentPositions/ServiceSet", fields: { documentEntityId: I, serviceSetId: I, documentTableId: S }, required: ["documentEntityId", "serviceSetId"], guard: positionGuard },
+  position_text: { label: "Textzeile ohne Preis anlegen", res: "DocumentPositions", method: "POST", path: () => "/v2/DocumentPositions/TextPosition", fields: { documentEntityId: I, text: TXT, documentTableId: S }, required: ["documentEntityId", "text"], defaults: () => ({ amount1: 0, tax: 0 }), guard: positionGuard },
+  position_aendern: { label: "Position ändern", res: "DocumentPositions", method: "PUT", path: (id) => `/v2/DocumentPositions/${id}`, fields: POS_EDIT, keep: POS_PUT_KEEP, merge: true, needId: true, check: (cur, api) => positionGuard({ data: { documentEntityId: cur.documentEntityId, documentTableId: cur.documentTableId }, api }) },
+  // Zahlungen
+  zahlung_erfassen: { label: "Zahlungseingang an einer Rechnung erfassen", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/Payments`, fields: { amount: N, paymentDate: DT, typeOfPayment: PAY_TYPES }, required: ["amount", "paymentDate", "typeOfPayment"], needId: true, defaults: () => ({ typeOfPayment: "BankAccount", paymentDate: new Date().toISOString() }), guard: paymentGuard, after: afterPayment },
+  // Geplante Umsätze
+  geplanter_umsatz_anlegen: { label: "Geplanten Umsatz anlegen", res: "PlannedRevenues", method: "POST", path: () => "/v2/PlannedRevenues", fields: PR_NEW, required: ["companyId", "startDate", "description"], defaults: () => ({ interval: "Once", performancePeriod: "DueDateMonth", invoiceType: "Invoice", invoiceDate: "InvoiceCreation", currency: "EUR", marginPercent: 0, discountPercent: 0, documentType: "PlannedRevenueStandard" }) },
+  geplanter_umsatz_aendern: { label: "Geplanten Umsatz ändern", res: "PlannedRevenues", method: "PUT", path: (id) => `/v2/PlannedRevenues/${id}`, fields: PR_EDIT, keep: PR_KEEP, merge: true, needId: true },
+  geplanter_umsatz_status: { label: "Status eines geplanten Umsatzes setzen", res: "PlannedRevenues", method: "POST", path: (id, _a, _s, d) => `/v2/PlannedRevenues/${id}/ChangeStatusTo/${d.status}`, fields: { status: ["Quoted", "Planned", "Billed", "Deferred", "Declined"] }, required: ["status"], needId: true, toBody: noBody },
+  // CRM (auch Rolle team)
+  firma_anlegen: { team: true, label: "Firma mit Adresse und Firmentypen anlegen", res: "Companies", method: "POST", path: () => "/v2/Companies", fields: COMP_NEW_V2, required: ["name", "street", "zipCode", "city"], defaults: () => ({ country: "DE" }),
+    toBody: ({ companyTypeIds, responsibleUserIds, street, houseNumber, zipCode, city, country, addressEmail, addressPhone, ...rest }) => ({ ...rest, eInvoiceType: "None", defaultAddress: { description: "Standardanschrift", street, houseNumber, zipCode, city, country, email: addressEmail, phone: addressPhone }, ...(companyTypeIds ? { companyTypes: companyTypeIds.map((companyTypeId) => ({ companyTypeId })) } : {}), ...(responsibleUserIds ? { responsibleUserIds } : {}) }) },
+  firmentypen_setzen: { team: true, label: "Firmentypen setzen (ersetzt die bisherigen)", res: "Companies", method: "POST", path: (id) => `/v2/Companies/${id}/UpdateCompanyTypes`, fields: { companyTypeIds: IDS }, required: ["companyTypeIds"], needId: true, toBody: (b) => b.companyTypeIds.map((companyTypeId) => ({ companyTypeId })) },
+  ansprechpartner_anlegen: { team: true, label: "Ansprechpartner anlegen (mit E-Mail)", res: "ContactPersons", method: "POST", path: () => "/v2/ContactPersons", fields: CONT_NEW_V2, required: ["companyId", "lastName"] },
+  ansprechpartner_aendern: { team: true, label: "Ansprechpartner ändern (auch E-Mail)", res: "ContactPersons", method: "PUT", path: (id) => `/v2/ContactPersons/${id}`, fields: CONT_EDIT_V2, keep: CONT_KEEP_V2, merge: true, needId: true },
+  historie_anlegen: { team: true, label: "Historieneintrag anlegen (mit Wiedervorlage)", res: "ContactHistories", method: "POST", path: () => "/v2/ContactHistories", fields: HIST_V2, required: ["companyId", "reason"], defaults: (s) => ({ userId: s.uid, contactOn: new Date().toISOString(), contactHistoryChannel: "Note", contactHistoryStatus: "Reached" }),
+    toBody: ({ responsibleUserIds, ...rest }) => ({ ...rest, ...(responsibleUserIds ? { responsibleUserIds } : {}) }) },
+  lead_anlegen: { team: true, label: "Lead anlegen", res: "Leads", method: "POST", path: () => "/v2/Leads", fields: LEAD_V2, required: ["name", "companyId"], defaults: (s) => ({ currency: "EUR", responsibleUserId: s.uid }) },
+  lead_status_setzen: { team: true, label: "Status eines Leads setzen", res: "Leads", method: "POST", path: (id) => `/v2/Leads/${id}/Status`, fields: { statusId: I }, required: ["statusId"], needId: true },
+  projekt_aendern: { team: true, label: "Projekt ändern", res: "Projects", method: "PUT", path: (id) => `/v2/Projects/${id}`, fields: PROJ_EDIT_V2, keep: ["name", "startDate", "companyId", "internalContactPersonId"], merge: true, needId: true },
 };
 
 const escapeHtml = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -517,7 +615,7 @@ function cleanValue(field, type, v) {
   switch (type) {
     case I:
       if (!Number.isInteger(v)) throw bad("ganze Zahl erwartet");
-      if (field === "ClosingProbability" && (v < 0 || v > 100)) throw bad("0 bis 100 erwartet");
+      if ((field === "ClosingProbability" || field === "probability") && (v < 0 || v > 100)) throw bad("0 bis 100 erwartet");
       return v;
     case N:
       if (typeof v !== "number" || !Number.isFinite(v)) throw bad("Zahl erwartet");
@@ -571,7 +669,7 @@ async function prepareWrite(spec, session, { id, adress_id, daten }, api) {
   if (spec.needId && !Number.isInteger(id)) throw new Error("Für diese Aktion wird die Nummer (id) gebraucht.");
   if (spec.needAddr && !Number.isInteger(adress_id)) throw new Error("Für diese Aktion wird die adress_id gebraucht.");
   const data = validateData(spec, daten);
-  const path = spec.path(id, adress_id, session);
+  const path = spec.path(id, adress_id, session, data);
   if (spec.merge) {
     if (!Object.keys(data).length) throw new Error("Keine Änderungen angegeben (daten ist leer).");
     const cur = await fetchCurrent(path, api, spec.nested ? { $expand: spec.nested } : undefined);
@@ -586,8 +684,14 @@ async function prepareWrite(spec, session, { id, adress_id, daten }, api) {
     return { method: spec.method, path, body, preview: { aenderungen: changes } };
   }
   const body = { ...(spec.defaults ? spec.defaults(session) : {}), ...data };
+  let info = {};
+  if (spec.guard) {
+    const g = (await spec.guard({ id, data: body, api, session })) || {};
+    for (const [k, v] of Object.entries(g.set || {})) if (body[k] === undefined) body[k] = v;
+    info = g.info || {};
+  }
   for (const r of spec.required || []) if (body[r] === undefined || body[r] === "") throw new Error(`Pflichtfeld fehlt: ${r}`);
-  return { method: spec.method, path, body: spec.toBody ? spec.toBody(body) : body, preview: { neue_daten: body } };
+  return { method: spec.method, path, body: spec.toBody ? spec.toBody(body) : body, preview: { ...info, neue_daten: body } };
 }
 
 // Änderung in eingebetteten Daten (z.B. DefaultAddress, CompanyTypes): spec.build liefert Änderungen und Teil-Body,
@@ -726,7 +830,7 @@ function registerWriteTool(server, { name, title, specs, api, session, role, hin
         }
         if (!markCodeUsed(vorschau_code)) throw new Error("Diese Vorschau wurde bereits verwendet. Bitte eine neue Vorschau erzeugen.");
         const { status, text } = await hqRequest(p.method, p.path, { base: api.base, token: api.token, body: p.body });
-        const extra = spec.vermerk ? await addVermerk(text, session, api) : spec.nested ? await verifyNested(spec, p, api) : {};
+        const extra = spec.vermerk ? await addVermerk(text, session, api) : spec.nested ? await verifyNested(spec, p, api) : spec.after ? await spec.after(text, p, api) : {};
         auditWrite({ ...log, status, felder: Object.keys(data), ...extra });
         if (!Object.keys(extra).length) return asResult(text || JSON.stringify({ ok: true, status }));
         let ergebnis = text;
@@ -762,7 +866,6 @@ const REPORT_NEEDS = {
   zeiten: [["UserReportings", "v1"], ["Projects", "v1"], ["Companies", "v1"]],
   kundenhistorie: [["ContactHistories", "v1"]],
 };
-const INVOICE_TYPES = ["Invoice", "AdvancedInvoice", "FinalInvoice"];
 
 const round2 = (x) => Math.round(x * 100) / 100;
 const orIds = (field, ids) => ids.map((i) => `${field} eq ${Number(i)}`).join(" or ");
@@ -918,7 +1021,9 @@ function buildOAuthServer(session, role) {
   const v1 = { v: "v1", base: BASE, token: session.a };
   const v2 = { v: "v2", base: BASE_V2, token: v2TokenFor(session) };
   const canWrite = WRITE_ENABLED && WRITE_ROLES.has(role.name);
-  const canWriteV2 = WRITE_V2_ENABLED && Boolean(v2.token) && WRITE_ROLES_V2.has(role.name);
+  // v2-Aktionen je Rolle: CRM (team: true) für WRITE_ROLES, alles andere nur für WRITE_ROLES_V2
+  const specsV2 = Object.fromEntries(Object.entries(SPECS_V2).filter(([, sp]) => (sp.team ? WRITE_ROLES : WRITE_ROLES_V2).has(role.name)));
+  const canWriteV2 = WRITE_V2_ENABLED && Boolean(v2.token) && Object.keys(specsV2).length > 0;
   // Personenbezogene Ressourcen dürfen auch nicht über expand oder Unterpfade anderer Ressourcen auftauchen
   const checkOwnWords = (text) => {
     if (!text || !role.def || role.def.all) return;
@@ -950,7 +1055,7 @@ function buildOAuthServer(session, role) {
           schreibzugriff: canWrite,
           schreib_aktionen: canWrite ? Object.keys(SPECS) : [],
           schreibzugriff_v2: canWriteV2,
-          schreib_aktionen_v2: canWriteV2 ? Object.keys(SPECS_V2) : [],
+          schreib_aktionen_v2: canWriteV2 ? Object.keys(specsV2) : [],
           loeschen: false,
         })
       )
@@ -1169,17 +1274,18 @@ function buildOAuthServer(session, role) {
   if (canWriteV2) {
     registerWriteTool(server, {
       name: "hellohq_v2_schreiben",
-      title: "helloHQ v2: Entwürfe und Stammdaten anlegen oder ändern",
-      specs: SPECS_V2,
+      title: "helloHQ v2: Belege, Zahlungen, geplante Umsätze und CRM anlegen oder ändern",
+      specs: specsV2,
       api: v2,
       session,
       role,
       hints:
-        "Belege nur als Entwurf: kein Festschreiben, Versenden, Statuswechsel, keine Zahlungen. Das macht ein Mensch in helloHQ. " +
-        "beleg_entwurf_anlegen braucht documentTemplateEntityId (mit hellohq_v2_list auf DocumentTemplates nachsehen), companyId, Leistungszeitraum und validUntilDate; an den neuen Beleg wird automatisch ein Kommentar mit dem Namen der Person gehängt. " +
-        "beleg_entwurf_aendern geht nur, solange der Beleg den Status Entwurf hat. beleg_kommentar: id ist die Belegnummer, Feld message. " +
-        "firmentypen_setzen: id ist die Firmen-id, companyTypeIds als Liste wie \"3,7\" (ersetzt alle bisherigen Typen, IDs mit hellohq_v2_list auf CompanyTypes nachsehen). " +
-        "ansprechpartner_aendern setzt auch eMail.",
+        "Welche Aktionen du hast, hängt von der Rolle ab. Löschen, Festschreiben, Versenden und Statuswechsel von Belegen gehen nicht, das macht ein Mensch in helloHQ. Zeiten werden in awork gebucht, nicht hier. " +
+        "Belege: beleg_entwurf_anlegen braucht documentTemplateEntityId (hellohq_v2_list auf DocumentTemplates), companyId, Leistungszeitraum und validUntilDate. beleg_aus_beleg (id = Quellbeleg, documentType z.B. Invoice) und beleg_kopieren erzeugen neue Entwürfe. Neue Belege bekommen automatisch einen Kommentar mit dem Namen der Person. Ändern, Vorlage wechseln und Positionen gehen nur bei Entwürfen. " +
+        "Positionen: documentEntityId ist die Belegnummer (id) oder die id eines geplanten Umsatzes; die Tabelle wird automatisch gewählt. position_freitext braucht text, amount1 (Menge), price (netto je Einheit), tax ist 19 wenn nicht angegeben. position_leistung braucht servicePriceId, position_leistungsset serviceSetId (hellohq_v2_list auf Services). position_aendern: id ist die Positionsnummer. " +
+        "zahlung_erfassen: id ist die Rechnungsnummer (id), nur versendete Rechnungen, amount höchstens der offene Betrag, typeOfPayment BankAccount (Überweisung), DebitCharge (Lastschrift), CreditCard, Cash oder EarlyPayment (Skonto), paymentDate ist heute wenn nicht angegeben. Nimm Betrag und Datum nur aus Angaben der Person oder einem Kontoauszug, den sie dir gibt. " +
+        "geplanter_umsatz_anlegen legt den Rahmen an (description, companyId, startDate, interval); den Betrag setzt du danach mit position_freitext auf die id des geplanten Umsatzes. " +
+        "CRM: firma_anlegen mit Adresse (street, zipCode, city) und companyTypeIds (z.B. \"4004\" für Interessent, hellohq_v2_list auf CompanyTypes). ansprechpartner_anlegen und ansprechpartner_aendern setzen auch eMail. historie_anlegen: reason ist der Betreff, nextContactDate setzt eine Wiedervorlage. firmentypen_setzen ersetzt alle Typen, deshalb vorhandene Typen mit angeben.",
     });
   }
 
