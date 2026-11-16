@@ -40,7 +40,7 @@ const {
   ENABLE_WRITE_V2 = "false",
 } = process.env;
 
-const VERSION = "2.7.1";
+const VERSION = "2.7.2";
 
 const LEGACY_ON = Boolean(HELLOHQ_API_TOKEN) && Boolean(MCP_SECRET) && MCP_SECRET.length >= 24;
 const OAUTH_ON =
@@ -497,8 +497,8 @@ const SPECS = {
 
 // v2: Belege nur als Entwurf. Kein Statuswechsel, kein Versand, keine Zahlungen, kein Löschen.
 const DOC_TYPES = ["Quotation", "Confirmation", "Invoice", "AdvancedInvoice", "FinalInvoice"];
-const DOC_NEW = { documentType: DOC_TYPES, companyId: I, contactPersonId: I, projectId: I, leadId: I, documentTemplateEntityId: I, date: DT, validUntilDate: DT, deliveryDate: DT, performancePeriodStartDate: DT, performancePeriodEndDate: DT, currency: ["EUR", "CHF", "USD", "GBP"], note: S, paymentConditionId: I, deliveryConditionId: I, internalContactPersonId: I };
-const DOC_EDIT = { date: DT, validUntilDate: DT, deliveryDate: DT, performancePeriodStartDate: DT, performancePeriodEndDate: DT, note: S, contactPersonId: I, projectId: I, leadId: I, paymentConditionId: I, deliveryConditionId: I, internalContactPersonId: I };
+const DOC_NEW = { documentType: DOC_TYPES, companyId: I, contactPersonId: I, projectId: I, leadId: I, documentTemplateEntityId: I, date: DT, validUntilDate: DT, performancePeriodStartDate: DT, performancePeriodEndDate: DT, currency: ["EUR", "CHF", "USD", "GBP"], note: S, paymentConditionId: I, deliveryConditionId: I, internalContactPersonId: I };
+const DOC_EDIT = { date: DT, validUntilDate: DT, performancePeriodStartDate: DT, performancePeriodEndDate: DT, note: S, contactPersonId: I, projectId: I, leadId: I, paymentConditionId: I, deliveryConditionId: I, internalContactPersonId: I };
 const DOC_KEEP = [...Object.keys(DOC_EDIT), "discountNet", "discountPercent", "marginNet", "marginPercent", "taxOption", "currency", "serviceType", "companyPurchaseOrderNumberId", "financesBankAccountId", "companyId"];
 const PROJ_EDIT_V2 = { name: S, startDate: DT, internalContactPersonId: I };
 const CONT_EDIT_V2 = { eMail: S, position: S, phoneLandline: S, phoneMobile: S };
@@ -512,17 +512,18 @@ async function requireDraft(cur, api) {
 }
 
 // Beleg über die Nummer lesen und prüfen, dass er ein Entwurf ist
-// Lieferdatum steht nicht in der API-Beschreibung für Anlegen und Ändern. Deshalb nach dem Schreiben nachlesen.
-async function verifyDelivery(text, p, api) {
-  const want = p.body?.deliveryDate;
-  if (!want) return {};
+// Lieferdatum: helloHQ setzt es beim Anlegen auf Anlagetag plus 7 Tage und übernimmt es über die API nicht
+// (getestet 16.11.2026 mit deliveryDate, DeliveryDate, deliveryOn, delivery). Deshalb Link zum Beleg in helloHQ mitgeben.
+const DELIVERY_HINT = "Das Lieferdatum kann über die Schnittstelle nicht gesetzt werden. helloHQ setzt es beim Anlegen auf Anlagetag plus 7 Tage. Bitte im Beleg in helloHQ über den Link von Hand ändern.";
+const docLink = (id) => `${BASE_V2}/documentsdetails?documentid=${id}`;
+async function docLinkExtra(text, p, api) {
   try {
-    const id = p.method === "PUT" ? p.path.split("/").pop() : JSON.parse(text)?.id;
+    const id = p.method === "PUT" ? Number(p.path.split("/").pop()) : JSON.parse(text)?.id;
+    if (!Number.isInteger(id)) return {};
     const cur = await fetchCurrent(`/v2/Documents/${id}`, api);
-    const ok = String(cur.deliveryDate || "").slice(0, 10) === String(want).slice(0, 10);
-    return { lieferdatum: ok ? "gespeichert" : `ACHTUNG: helloHQ hat das Lieferdatum nicht übernommen (steht auf ${String(cur.deliveryDate || "leer").slice(0, 10)}). Bitte in helloHQ von Hand setzen.` };
-  } catch (e) {
-    return { lieferdatum: "Nachlesen fehlgeschlagen: " + String(e.message || e).slice(0, 120) };
+    return { link_hellohq: docLink(id), lieferdatum: String(cur.deliveryDate || "").slice(0, 10) || null, hinweis_lieferdatum: DELIVERY_HINT };
+  } catch {
+    return {};
   }
 }
 
@@ -606,7 +607,7 @@ async function incomingGuard({ data, api }) {
     if (dup) throw new Error(`Eine Eingangsrechnung mit der Nummer ${data.number} gibt es bei diesem Lieferanten schon (Beleg ${dup.id}).`);
   }
   const d = data.date;
-  return { set: { documentTemplateEntityId: tpl.id, validUntilDate: d, deliveryDate: d, performancePeriodStartDate: d, performancePeriodEndDate: d }, info: { vorlage: tpl.name } };
+  return { set: { documentTemplateEntityId: tpl.id, validUntilDate: d, performancePeriodStartDate: d, performancePeriodEndDate: d }, info: { vorlage: tpl.name } };
 }
 
 const POS_FREE = { documentEntityId: I, text: TXT, amount1: N, unitId1: I, price: N, tax: N, discountPercent: N, isOptional: B, performancePeriodStartDate: DT, performancePeriodEndDate: DT, documentTableId: S };
@@ -625,11 +626,11 @@ const noBody = () => undefined;
 // team: true heißt, die Aktion steht allen Rollen aus WRITE_ROLES offen (CRM). Alle anderen nur WRITE_ROLES_V2 (finance, gf).
 const SPECS_V2 = {
   // Belege (nur Entwürfe)
-  beleg_entwurf_anlegen: { label: "Belegentwurf anlegen", res: "Documents", method: "POST", path: () => "/v2/Documents", fields: DOC_NEW, required: ["documentType", "companyId", "documentTemplateEntityId", "date", "validUntilDate", "performancePeriodStartDate", "performancePeriodEndDate", "currency"], defaults: () => ({ currency: "EUR", date: new Date().toISOString() }), vermerk: true, after: verifyDelivery },
-  beleg_entwurf_aendern: { label: "Belegentwurf ändern", res: "Documents", method: "PUT", path: (id) => `/v2/Documents/${id}`, fields: DOC_EDIT, keep: DOC_KEEP, merge: true, needId: true, check: requireDraft, after: verifyDelivery },
-  eingangsrechnung_anlegen: { label: "Eingangsrechnung als Entwurf anlegen", res: "Documents", method: "POST", path: () => "/v2/Documents", fields: { companyId: I, number: S, date: DT, validUntilDate: DT, deliveryDate: DT, performancePeriodStartDate: DT, performancePeriodEndDate: DT, currency: ["EUR", "CHF", "USD", "GBP"], note: S, projectId: I, documentTemplateEntityId: I }, required: ["companyId", "number", "date", "documentTemplateEntityId", "validUntilDate", "performancePeriodStartDate", "performancePeriodEndDate", "currency"], defaults: () => ({ documentType: "IncomingInvoice", currency: "EUR" }), guard: incomingGuard, vermerk: true, after: verifyDelivery },
-  beleg_aus_beleg: { label: "Neuen Entwurf aus einem Beleg erzeugen (z.B. Angebot zu Rechnung)", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/CreateFromDocument`, fields: { documentType: ["Quotation", "Confirmation", "Invoice", "AdvancedInvoice", "FinalInvoice", "DeliveryNote"] }, required: ["documentType"], needId: true, guard: sourceDocGuard, vermerk: true },
-  beleg_kopieren: { label: "Beleg als neuen Entwurf kopieren", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/Copy`, fields: {}, needId: true, guard: sourceDocGuard, toBody: noBody, vermerk: true },
+  beleg_entwurf_anlegen: { label: "Belegentwurf anlegen", res: "Documents", method: "POST", path: () => "/v2/Documents", fields: DOC_NEW, required: ["documentType", "companyId", "documentTemplateEntityId", "date", "validUntilDate", "performancePeriodStartDate", "performancePeriodEndDate", "currency"], defaults: () => ({ currency: "EUR", date: new Date().toISOString() }), vermerk: true, after: docLinkExtra },
+  beleg_entwurf_aendern: { label: "Belegentwurf ändern", res: "Documents", method: "PUT", path: (id) => `/v2/Documents/${id}`, fields: DOC_EDIT, keep: DOC_KEEP, merge: true, needId: true, check: requireDraft, after: docLinkExtra },
+  eingangsrechnung_anlegen: { label: "Eingangsrechnung als Entwurf anlegen", res: "Documents", method: "POST", path: () => "/v2/Documents", fields: { companyId: I, number: S, date: DT, validUntilDate: DT, performancePeriodStartDate: DT, performancePeriodEndDate: DT, currency: ["EUR", "CHF", "USD", "GBP"], note: S, projectId: I, documentTemplateEntityId: I }, required: ["companyId", "number", "date", "documentTemplateEntityId", "validUntilDate", "performancePeriodStartDate", "performancePeriodEndDate", "currency"], defaults: () => ({ documentType: "IncomingInvoice", currency: "EUR" }), guard: incomingGuard, vermerk: true, after: docLinkExtra },
+  beleg_aus_beleg: { label: "Neuen Entwurf aus einem Beleg erzeugen (z.B. Angebot zu Rechnung)", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/CreateFromDocument`, fields: { documentType: ["Quotation", "Confirmation", "Invoice", "AdvancedInvoice", "FinalInvoice", "DeliveryNote"] }, required: ["documentType"], needId: true, guard: sourceDocGuard, vermerk: true, after: docLinkExtra },
+  beleg_kopieren: { label: "Beleg als neuen Entwurf kopieren", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/Copy`, fields: {}, needId: true, guard: sourceDocGuard, toBody: noBody, vermerk: true, after: docLinkExtra },
   beleg_vorlage_wechseln: { label: "Vorlage eines Entwurfs wechseln", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/ChangeTemplate`, fields: { documentTemplateId: I, replaceOrderedElementsFromTemplate: B }, required: ["documentTemplateId"], needId: true, defaults: () => ({ replaceOrderedElementsFromTemplate: false }), guard: ({ id, api }) => draftDoc(id, api).then((c) => ({ info: { beleg_id: id, vorlage_bisher: c.documentTemplateEntityId } })) },
   beleg_kommentar: { label: "Kommentar an Beleg", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/Comments`, fields: { message: TXT }, required: ["message"], needId: true, defaults: (s) => ({ userId: s.uid }) },
   // Positionen (Beleg im Entwurf oder geplanter Umsatz)
@@ -701,6 +702,7 @@ function cleanValue(field, type, v) {
 function validateData(spec, daten) {
   const out = {};
   for (const [k, v] of Object.entries(daten || {})) {
+    if (/^deliver/i.test(k)) throw new Error(DELIVERY_HINT + " Den Link liefert die Antwort beim Anlegen oder Ändern des Belegs (link_hellohq).");
     if (!(k in spec.fields)) throw new Error(`Feld "${k}" ist nicht erlaubt. Erlaubt: ${Object.keys(spec.fields).join(", ")}`);
     out[k] = cleanValue(k, spec.fields[k], v);
   }
@@ -1340,8 +1342,8 @@ function buildOAuthServer(session, role) {
       role,
       hints:
         "Welche Aktionen du hast, hängt von der Rolle ab. Löschen, Festschreiben, Versenden und Statuswechsel von Belegen gehen nicht, das macht ein Mensch in helloHQ. Zeiten werden in awork gebucht, nicht hier. " +
-        "Belege: beleg_entwurf_anlegen braucht documentTemplateEntityId (hellohq_v2_list auf DocumentTemplates), companyId, Leistungszeitraum und validUntilDate. beleg_aus_beleg (id = Quellbeleg, documentType z.B. Invoice) und beleg_kopieren erzeugen neue Entwürfe. Neue Belege bekommen automatisch einen Kommentar mit dem Namen der Person. Ändern, Vorlage wechseln und Positionen gehen nur bei Entwürfen. Das Lieferdatum heißt deliveryDate und lässt sich bei Entwürfen mit beleg_entwurf_aendern setzen; ob helloHQ es übernimmt, wird nachgelesen. " +
-        "eingangsrechnung_anlegen: companyId ist der Lieferant, number die Rechnungsnummer des Lieferanten, date das Rechnungsdatum, validUntilDate die Fälligkeit (sonst Rechnungsdatum), Leistungszeitraum sonst Rechnungsdatum; die Vorlage wird automatisch gewählt; doppelte Nummern beim selben Lieferanten werden abgelehnt. deliveryDate (Lieferdatum) ist ohne Angabe das Rechnungsdatum. Die Beträge setzt du danach mit position_freitext (price netto, tax Steuersatz) auf die id der neuen Eingangsrechnung. Nimm alle Werte nur aus der Rechnung, die die Person dir gibt. " +
+        "Belege: beleg_entwurf_anlegen braucht documentTemplateEntityId (hellohq_v2_list auf DocumentTemplates), companyId, Leistungszeitraum und validUntilDate. beleg_aus_beleg (id = Quellbeleg, documentType z.B. Invoice) und beleg_kopieren erzeugen neue Entwürfe. Neue Belege bekommen automatisch einen Kommentar mit dem Namen der Person. Ändern, Vorlage wechseln und Positionen gehen nur bei Entwürfen. Das Lieferdatum lässt sich über die Schnittstelle nicht setzen (helloHQ setzt Anlagetag plus 7 Tage). Gib der Person nach dem Anlegen den Link link_hellohq aus der Antwort und sag ihr, dass sie das Lieferdatum dort von Hand ändern muss. " +
+        "eingangsrechnung_anlegen: companyId ist der Lieferant, number die Rechnungsnummer des Lieferanten, date das Rechnungsdatum, validUntilDate die Fälligkeit (sonst Rechnungsdatum), Leistungszeitraum sonst Rechnungsdatum; die Vorlage wird automatisch gewählt; doppelte Nummern beim selben Lieferanten werden abgelehnt. Die Beträge setzt du danach mit position_freitext (price netto, tax Steuersatz) auf die id der neuen Eingangsrechnung. Nimm alle Werte nur aus der Rechnung, die die Person dir gibt. " +
         "Positionen: documentEntityId ist die Belegnummer (id) oder die id eines geplanten Umsatzes; die Tabelle wird automatisch gewählt. position_freitext braucht text, amount1 (Menge), price (netto je Einheit), tax ist 19 wenn nicht angegeben. position_leistung braucht servicePriceId, position_leistungsset serviceSetId (hellohq_v2_list auf Services). position_aendern: id ist die Positionsnummer. " +
         "zahlung_erfassen: id ist die Rechnungsnummer (id), nur versendete Rechnungen, amount höchstens der offene Betrag, typeOfPayment BankAccount (Überweisung), DebitCharge (Lastschrift), CreditCard, Cash oder EarlyPayment (Skonto), paymentDate ist heute wenn nicht angegeben. zahlungsausgang_erfassen genauso für bezahlte Eingangsrechnungen, nur wenn sie angenommen (freigegeben) sind. Nimm Betrag und Datum nur aus Angaben der Person oder einem Kontoauszug, den sie dir gibt. " +
         "geplanter_umsatz_anlegen legt den Rahmen an (description, companyId, startDate, interval); den Betrag setzt du danach mit position_freitext auf die id des geplanten Umsatzes. " +
@@ -1368,7 +1370,7 @@ function buildOAuthServer(session, role) {
           if (cur.documentType !== "IncomingInvoice") throw new Error(`Anhänge gehen hier nur an Eingangsrechnungen. Beleg ${beleg_id} ist vom Typ ${cur.documentType}.`);
           const code = seal("upl", { u: session.uid, un: session.un, d: beleg_id }, 600);
           auditWrite({ mode: "oauth", api: "v2", user: session.un, role: role.name, aktion: "pdf_link", id: beleg_id });
-          return asResult(JSON.stringify({ link: `${PUBLIC}/upload/${code}`, beleg: cur.number || beleg_id, gueltig: "10 Minuten, einmal", hinweis: "Gib der Person diesen Link. Sie öffnet ihn im Browser und wählt die PDF aus." }));
+          return asResult(JSON.stringify({ link: `${PUBLIC}/upload/${code}`, beleg: cur.number || beleg_id, gueltig: "10 Minuten, einmal", hinweis: "Gib der Person diesen Link. Sie öffnet ihn im Browser und wählt die PDF aus.", link_hellohq: docLink(beleg_id), hinweis_lieferdatum: DELIVERY_HINT }));
         } catch (e) {
           return asError(e);
         }
