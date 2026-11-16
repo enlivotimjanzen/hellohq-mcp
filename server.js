@@ -40,7 +40,7 @@ const {
   ENABLE_WRITE_V2 = "false",
 } = process.env;
 
-const VERSION = "2.5.0";
+const VERSION = "2.7.0";
 
 const LEGACY_ON = Boolean(HELLOHQ_API_TOKEN) && Boolean(MCP_SECRET) && MCP_SECRET.length >= 24;
 const OAUTH_ON =
@@ -101,6 +101,21 @@ async function hqRequest(method, path, { query = {}, body, token = HELLOHQ_API_T
   const text = await res.text();
   if (!res.ok) throw new Error(`helloHQ antwortete mit ${res.status}: ${text.slice(0, 500)}`);
   return { status: res.status, text, headers: res.headers };
+}
+
+// Datei als multipart an helloHQ senden (nur für Anhänge an Belegen)
+async function hqUpload(path, { token, base, fields, file, filename }) {
+  if (!base) throw new Error("API-Adresse ist nicht eingerichtet.");
+  if (path.includes("..") || path.includes("//")) throw new Error("Ungültiger Pfad.");
+  const url = new URL(base + path);
+  if (url.origin !== new URL(base).origin) throw new Error("Fremder Host blockiert.");
+  const form = new FormData();
+  for (const [k, v] of Object.entries(fields)) form.append(k, String(v));
+  form.append("Content", new Blob([file], { type: "application/pdf" }), filename);
+  const res = await fetch(url, { method: "POST", headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }, body: form });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`helloHQ antwortete mit ${res.status}: ${text.slice(0, 300)}`);
+  return { status: res.status, text };
 }
 
 // Alle Seiten einer Liste holen (für Auswertungen). v1: OData mit value, v2: Array.
@@ -525,20 +540,26 @@ async function positionGuard({ data, api }) {
 const INVOICE_TYPES = ["Invoice", "AdvancedInvoice", "FinalInvoice"];
 const PAY_TYPES = ["BankAccount", "DebitCharge", "CreditCard", "Cash", "EarlyPayment"];
 
-// Zahlung nur an versendeten Rechnungen und höchstens in Höhe des offenen Betrags
-async function paymentGuard({ id, data, api }) {
+// Zahlung nur an passenden Belegen im passenden Status und höchstens in Höhe des offenen Betrags.
+// Ausgangsrechnungen: versendet. Eingangsrechnungen: angenommen (freigegeben).
+const PAY_RULES = {
+  ein: { types: INVOICE_TYPES, status: "Sent", text: "Zahlungseingänge gehen nur an versendete Ausgangsrechnungen" },
+  aus: { types: ["IncomingInvoice"], status: "Accepted", text: "Zahlungsausgänge gehen nur an angenommene (freigegebene) Eingangsrechnungen" },
+};
+const paymentGuard = (kind) => async ({ id, data, api }) => {
+  const rule = PAY_RULES[kind];
   const cur = await fetchCurrent(`/v2/Documents/${id}`, api);
-  if (!INVOICE_TYPES.includes(cur.documentType)) throw new Error(`Zahlungen gehen nur an Rechnungen. Dieser Beleg ist vom Typ ${cur.documentType}.`);
+  if (!rule.types.includes(cur.documentType)) throw new Error(`${rule.text}. Dieser Beleg ist vom Typ ${cur.documentType}.`);
   const { text } = await hqRequest("GET", `/v2/DocumentStatus/${cur.documentStatusEntityId}`, { base: api.base, token: api.token });
   const st = JSON.parse(text);
-  if (st.documentStatusType !== "Sent") throw new Error(`Zahlungen gehen nur an versendete Rechnungen. Diese Rechnung hat den Status "${st.name || st.documentStatusType}".`);
+  if (st.documentStatusType !== rule.status) throw new Error(`${rule.text}. Dieser Beleg hat den Status "${st.name || st.documentStatusType}".`);
   const brutto = Number(cur.grossValue) || 0;
   const bezahlt = round2((cur.payments || []).reduce((sum, x) => sum + (Number(x.amount) || 0), 0));
   const offen = round2(brutto - bezahlt);
   if (!(data.amount > 0)) throw new Error("Feld \"amount\": Betrag größer 0 erwartet.");
   if (data.amount > offen + 0.005) throw new Error(`Der Betrag ${data.amount} ist höher als der offene Betrag ${offen} ${cur.currency || "EUR"}.`);
-  return { info: { rechnung: cur.number, firma: cur.company?.name ?? cur.companyId, brutto, bereits_bezahlt: bezahlt, offen_vorher: offen, offen_nachher: round2(offen - data.amount), waehrung: cur.currency || "EUR" } };
-}
+  return { info: { rechnung: cur.number, [kind === "aus" ? "lieferant" : "firma"]: cur.company?.name ?? cur.companyId, brutto, bereits_bezahlt: bezahlt, offen_vorher: offen, offen_nachher: round2(offen - data.amount), waehrung: cur.currency || "EUR" } };
+};
 
 // Nach der Zahlung den Status nachlesen
 async function afterPayment(_text, p, api) {
@@ -554,6 +575,24 @@ async function afterPayment(_text, p, api) {
 async function sourceDocGuard({ id, api }) {
   const cur = await fetchCurrent(`/v2/Documents/${id}`, api);
   return { info: { quelle: cur.number || "Entwurf ohne Nummer", quelle_typ: cur.documentType, firma: cur.company?.name ?? cur.companyId, netto: cur.netValue } };
+}
+
+// Eingangsrechnung: Vorlage vom Typ IncomingInvoice wählen und doppelte Rechnungsnummern desselben Lieferanten abweisen
+async function incomingGuard({ data, api }) {
+  if (!Number.isInteger(data.companyId)) throw new Error("Pflichtfeld fehlt: companyId (Lieferant).");
+  const { text } = await hqRequest("GET", "/v2/DocumentTemplates", { base: api.base, token: api.token });
+  const all = (JSON.parse(text) || []).filter((t) => t.documentType === "IncomingInvoice");
+  if (!all.length) throw new Error("In helloHQ gibt es keine Belegvorlage für Eingangsrechnungen.");
+  let tpl = all.find((t) => t.id === data.documentTemplateEntityId);
+  if (data.documentTemplateEntityId !== undefined && !tpl) throw new Error(`Vorlage ${data.documentTemplateEntityId} ist keine Vorlage für Eingangsrechnungen. Vorhanden: ${all.map((t) => `${t.name} (${t.id})`).join(", ")}`);
+  tpl = tpl || all.find((t) => t.isStandard) || all[0];
+  if (data.number) {
+    const docs = await fetchAll(api, "Documents", { filter: `documentType eq 'IncomingInvoice' and companyId eq ${data.companyId}` });
+    const dup = docs.find((d) => String(d.number || "").trim().toLowerCase() === data.number.trim().toLowerCase());
+    if (dup) throw new Error(`Eine Eingangsrechnung mit der Nummer ${data.number} gibt es bei diesem Lieferanten schon (Beleg ${dup.id}).`);
+  }
+  const d = data.date;
+  return { set: { documentTemplateEntityId: tpl.id, validUntilDate: d, performancePeriodStartDate: d, performancePeriodEndDate: d }, info: { vorlage: tpl.name } };
 }
 
 const POS_FREE = { documentEntityId: I, text: TXT, amount1: N, unitId1: I, price: N, tax: N, discountPercent: N, isOptional: B, performancePeriodStartDate: DT, performancePeriodEndDate: DT, documentTableId: S };
@@ -574,6 +613,7 @@ const SPECS_V2 = {
   // Belege (nur Entwürfe)
   beleg_entwurf_anlegen: { label: "Belegentwurf anlegen", res: "Documents", method: "POST", path: () => "/v2/Documents", fields: DOC_NEW, required: ["documentType", "companyId", "documentTemplateEntityId", "date", "validUntilDate", "performancePeriodStartDate", "performancePeriodEndDate", "currency"], defaults: () => ({ currency: "EUR", date: new Date().toISOString() }), vermerk: true },
   beleg_entwurf_aendern: { label: "Belegentwurf ändern", res: "Documents", method: "PUT", path: (id) => `/v2/Documents/${id}`, fields: DOC_EDIT, keep: DOC_KEEP, merge: true, needId: true, check: requireDraft },
+  eingangsrechnung_anlegen: { label: "Eingangsrechnung als Entwurf anlegen", res: "Documents", method: "POST", path: () => "/v2/Documents", fields: { companyId: I, number: S, date: DT, validUntilDate: DT, performancePeriodStartDate: DT, performancePeriodEndDate: DT, currency: ["EUR", "CHF", "USD", "GBP"], note: S, projectId: I, documentTemplateEntityId: I }, required: ["companyId", "number", "date", "documentTemplateEntityId", "validUntilDate", "performancePeriodStartDate", "performancePeriodEndDate", "currency"], defaults: () => ({ documentType: "IncomingInvoice", currency: "EUR" }), guard: incomingGuard, vermerk: true },
   beleg_aus_beleg: { label: "Neuen Entwurf aus einem Beleg erzeugen (z.B. Angebot zu Rechnung)", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/CreateFromDocument`, fields: { documentType: ["Quotation", "Confirmation", "Invoice", "AdvancedInvoice", "FinalInvoice", "DeliveryNote"] }, required: ["documentType"], needId: true, guard: sourceDocGuard, vermerk: true },
   beleg_kopieren: { label: "Beleg als neuen Entwurf kopieren", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/Copy`, fields: {}, needId: true, guard: sourceDocGuard, toBody: noBody, vermerk: true },
   beleg_vorlage_wechseln: { label: "Vorlage eines Entwurfs wechseln", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/ChangeTemplate`, fields: { documentTemplateId: I, replaceOrderedElementsFromTemplate: B }, required: ["documentTemplateId"], needId: true, defaults: () => ({ replaceOrderedElementsFromTemplate: false }), guard: ({ id, api }) => draftDoc(id, api).then((c) => ({ info: { beleg_id: id, vorlage_bisher: c.documentTemplateEntityId } })) },
@@ -585,7 +625,8 @@ const SPECS_V2 = {
   position_text: { label: "Textzeile ohne Preis anlegen", res: "DocumentPositions", method: "POST", path: () => "/v2/DocumentPositions/TextPosition", fields: { documentEntityId: I, text: TXT, documentTableId: S }, required: ["documentEntityId", "text"], defaults: () => ({ amount1: 0, tax: 0 }), guard: positionGuard },
   position_aendern: { label: "Position ändern", res: "DocumentPositions", method: "PUT", path: (id) => `/v2/DocumentPositions/${id}`, fields: POS_EDIT, keep: POS_PUT_KEEP, merge: true, needId: true, check: (cur, api) => positionGuard({ data: { documentEntityId: cur.documentEntityId, documentTableId: cur.documentTableId }, api }) },
   // Zahlungen
-  zahlung_erfassen: { label: "Zahlungseingang an einer Rechnung erfassen", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/Payments`, fields: { amount: N, paymentDate: DT, typeOfPayment: PAY_TYPES }, required: ["amount", "paymentDate", "typeOfPayment"], needId: true, defaults: () => ({ typeOfPayment: "BankAccount", paymentDate: new Date().toISOString() }), guard: paymentGuard, after: afterPayment },
+  zahlung_erfassen: { label: "Zahlungseingang an einer Rechnung erfassen", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/Payments`, fields: { amount: N, paymentDate: DT, typeOfPayment: PAY_TYPES }, required: ["amount", "paymentDate", "typeOfPayment"], needId: true, defaults: () => ({ typeOfPayment: "BankAccount", paymentDate: new Date().toISOString() }), guard: paymentGuard("ein"), after: afterPayment },
+  zahlungsausgang_erfassen: { label: "Zahlungsausgang an einer Eingangsrechnung erfassen", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/Payments`, fields: { amount: N, paymentDate: DT, typeOfPayment: PAY_TYPES }, required: ["amount", "paymentDate", "typeOfPayment"], needId: true, defaults: () => ({ typeOfPayment: "BankAccount", paymentDate: new Date().toISOString() }), guard: paymentGuard("aus"), after: afterPayment },
   // Geplante Umsätze
   geplanter_umsatz_anlegen: { label: "Geplanten Umsatz anlegen", res: "PlannedRevenues", method: "POST", path: () => "/v2/PlannedRevenues", fields: PR_NEW, required: ["companyId", "startDate", "description"], defaults: () => ({ interval: "Once", performancePeriod: "DueDateMonth", invoiceType: "Invoice", invoiceDate: "InvoiceCreation", currency: "EUR", marginPercent: 0, discountPercent: 0, documentType: "PlannedRevenueStandard" }) },
   geplanter_umsatz_aendern: { label: "Geplanten Umsatz ändern", res: "PlannedRevenues", method: "PUT", path: (id) => `/v2/PlannedRevenues/${id}`, fields: PR_EDIT, keep: PR_KEEP, merge: true, needId: true },
@@ -1282,11 +1323,39 @@ function buildOAuthServer(session, role) {
       hints:
         "Welche Aktionen du hast, hängt von der Rolle ab. Löschen, Festschreiben, Versenden und Statuswechsel von Belegen gehen nicht, das macht ein Mensch in helloHQ. Zeiten werden in awork gebucht, nicht hier. " +
         "Belege: beleg_entwurf_anlegen braucht documentTemplateEntityId (hellohq_v2_list auf DocumentTemplates), companyId, Leistungszeitraum und validUntilDate. beleg_aus_beleg (id = Quellbeleg, documentType z.B. Invoice) und beleg_kopieren erzeugen neue Entwürfe. Neue Belege bekommen automatisch einen Kommentar mit dem Namen der Person. Ändern, Vorlage wechseln und Positionen gehen nur bei Entwürfen. " +
+        "eingangsrechnung_anlegen: companyId ist der Lieferant, number die Rechnungsnummer des Lieferanten, date das Rechnungsdatum, validUntilDate die Fälligkeit (sonst Rechnungsdatum), Leistungszeitraum sonst Rechnungsdatum; die Vorlage wird automatisch gewählt; doppelte Nummern beim selben Lieferanten werden abgelehnt. Die Beträge setzt du danach mit position_freitext (price netto, tax Steuersatz) auf die id der neuen Eingangsrechnung. Nimm alle Werte nur aus der Rechnung, die die Person dir gibt. " +
         "Positionen: documentEntityId ist die Belegnummer (id) oder die id eines geplanten Umsatzes; die Tabelle wird automatisch gewählt. position_freitext braucht text, amount1 (Menge), price (netto je Einheit), tax ist 19 wenn nicht angegeben. position_leistung braucht servicePriceId, position_leistungsset serviceSetId (hellohq_v2_list auf Services). position_aendern: id ist die Positionsnummer. " +
-        "zahlung_erfassen: id ist die Rechnungsnummer (id), nur versendete Rechnungen, amount höchstens der offene Betrag, typeOfPayment BankAccount (Überweisung), DebitCharge (Lastschrift), CreditCard, Cash oder EarlyPayment (Skonto), paymentDate ist heute wenn nicht angegeben. Nimm Betrag und Datum nur aus Angaben der Person oder einem Kontoauszug, den sie dir gibt. " +
+        "zahlung_erfassen: id ist die Rechnungsnummer (id), nur versendete Rechnungen, amount höchstens der offene Betrag, typeOfPayment BankAccount (Überweisung), DebitCharge (Lastschrift), CreditCard, Cash oder EarlyPayment (Skonto), paymentDate ist heute wenn nicht angegeben. zahlungsausgang_erfassen genauso für bezahlte Eingangsrechnungen, nur wenn sie angenommen (freigegeben) sind. Nimm Betrag und Datum nur aus Angaben der Person oder einem Kontoauszug, den sie dir gibt. " +
         "geplanter_umsatz_anlegen legt den Rahmen an (description, companyId, startDate, interval); den Betrag setzt du danach mit position_freitext auf die id des geplanten Umsatzes. " +
+        "Die Original-PDF einer Eingangsrechnung hängst du über hellohq_v2_pdf_link an. " +
         "CRM: firma_anlegen mit Adresse (street, zipCode, city) und companyTypeIds (z.B. \"4004\" für Interessent, hellohq_v2_list auf CompanyTypes). ansprechpartner_anlegen und ansprechpartner_aendern setzen auch eMail. historie_anlegen: reason ist der Betreff, nextContactDate setzt eine Wiedervorlage. firmentypen_setzen ersetzt alle Typen, deshalb vorhandene Typen mit angeben.",
     });
+  }
+
+  if (canWriteV2 && "eingangsrechnung_anlegen" in specsV2) {
+    server.registerTool(
+      "hellohq_v2_pdf_link",
+      {
+        title: "helloHQ v2: Link zum Hochladen der PDF einer Eingangsrechnung",
+        description:
+          "Erzeugt einen persönlichen Link, über den die Person die Original-PDF des Lieferanten an eine Eingangsrechnung in helloHQ hängt. " +
+          "Claude kann die Datei nicht selbst übertragen: Gib der Person den Link, sie öffnet ihn im Browser und wählt die PDF aus. Der Link gilt 10 Minuten und nur einmal, nur für diese Person und diesen Beleg. " +
+          "beleg_id ist die id der Eingangsrechnung (zum Beispiel aus eingangsrechnung_anlegen).",
+        inputSchema: { beleg_id: z.number().int().positive().describe("id der Eingangsrechnung") },
+        annotations: { readOnlyHint: true, openWorldHint: true },
+      },
+      async ({ beleg_id }) => {
+        try {
+          const cur = await fetchCurrent(`/v2/Documents/${beleg_id}`, v2);
+          if (cur.documentType !== "IncomingInvoice") throw new Error(`Anhänge gehen hier nur an Eingangsrechnungen. Beleg ${beleg_id} ist vom Typ ${cur.documentType}.`);
+          const code = seal("upl", { u: session.uid, un: session.un, d: beleg_id }, 600);
+          auditWrite({ mode: "oauth", api: "v2", user: session.un, role: role.name, aktion: "pdf_link", id: beleg_id });
+          return asResult(JSON.stringify({ link: `${PUBLIC}/upload/${code}`, beleg: cur.number || beleg_id, gueltig: "10 Minuten, einmal", hinweis: "Gib der Person diesen Link. Sie öffnet ihn im Browser und wählt die PDF aus." }));
+        } catch (e) {
+          return asError(e);
+        }
+      }
+    );
   }
 
   return server;
@@ -1461,6 +1530,70 @@ if (OAUTH_ON) {
   });
   app.all("/mcp", (_req, res) => res.status(405).set("Allow", "POST").end());
 }
+
+// Hochladen der Original-PDF an eine Eingangsrechnung (Link aus hellohq_v2_pdf_link)
+const UPLOAD_PAGE = (titel, inhalt) =>
+  `<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PDF hochladen</title>` +
+  `<style>body{font-family:system-ui,sans-serif;max-width:560px;margin:40px auto;padding:0 16px;color:#1d1d1b}button{padding:10px 18px;font-size:16px}#s{margin-top:16px}</style></head>` +
+  `<body><h1>${escapeHtml(titel)}</h1>${inhalt}</body></html>`;
+function uploadContext(code) {
+  const d = unseal("upl", code);
+  if (!d) return { fehler: "Der Link ist ungültig oder abgelaufen. Bitte in Claude einen neuen Link anfordern." };
+  const role = roleFor(d.un, d.u);
+  if (!WRITE_V2_ENABLED || !WRITE_ROLES_V2.has(role.name)) return { fehler: "Keine Berechtigung zum Hochladen." };
+  const token = v2TokenFor({ uid: d.u, un: d.un });
+  if (!token) return { fehler: "Für diese Person ist kein v2-Zugang hinterlegt." };
+  return { d, role, api: { v: "v2", base: BASE_V2, token } };
+}
+const noStore = (res) => res.set({ "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff" });
+
+app.get("/upload/:code", async (req, res) => {
+  noStore(res);
+  const c = uploadContext(req.params.code);
+  if (c.fehler) return res.status(403).type("html").send(UPLOAD_PAGE("PDF hochladen", `<p>${escapeHtml(c.fehler)}</p>`));
+  let beleg = String(c.d.d);
+  try {
+    const cur = await fetchCurrent(`/v2/Documents/${c.d.d}`, c.api);
+    beleg = `${cur.number || cur.id}${cur.company?.name ? " von " + cur.company.name : ""}`;
+  } catch {
+    /* Anzeige ohne Details */
+  }
+  res.type("html").send(
+    UPLOAD_PAGE(
+      "PDF an Eingangsrechnung hängen",
+      `<p>Eingangsrechnung <strong>${escapeHtml(beleg)}</strong></p><p><input type="file" id="f" accept="application/pdf"></p><p><button id="b">Hochladen</button></p><p id="s"></p>` +
+        `<script>document.getElementById("b").onclick=async()=>{const f=document.getElementById("f").files[0],s=document.getElementById("s");if(!f){s.textContent="Bitte eine PDF auswählen.";return}` +
+        `s.textContent="Wird hochgeladen ...";const r=await fetch(location.pathname,{method:"POST",headers:{"Content-Type":"application/pdf","X-Dateiname":encodeURIComponent(f.name)},body:f});s.textContent=await r.text();if(r.ok)document.getElementById("b").disabled=true}</script>`
+    )
+  );
+});
+
+app.post("/upload/:code", express.raw({ type: "application/pdf", limit: "15mb" }), async (req, res) => {
+  noStore(res);
+  const c = uploadContext(req.params.code);
+  if (c.fehler) return res.status(403).type("text").send(c.fehler);
+  const file = req.body;
+  if (!Buffer.isBuffer(file) || file.length < 5 || file.subarray(0, 5).toString("latin1") !== "%PDF-") return res.status(400).type("text").send("Das ist keine PDF-Datei.");
+  if (!markCodeUsed(req.params.code)) return res.status(409).type("text").send("Dieser Link wurde bereits verwendet. Bitte in Claude einen neuen Link anfordern.");
+  let name = "Rechnung.pdf";
+  try {
+    name = decodeURIComponent(String(req.headers["x-dateiname"] || name)).replace(/[^\w.\- äöüÄÖÜß()]/g, "_").slice(0, 120) || name;
+  } catch {
+    /* Standardname */
+  }
+  if (!/\.pdf$/i.test(name)) name += ".pdf";
+  const log = { mode: "oauth", api: "v2", user: c.d.un, role: c.role.name, aktion: "pdf_hochladen", id: c.d.d, bytes: file.length };
+  try {
+    const cur = await fetchCurrent(`/v2/Documents/${c.d.d}`, c.api);
+    if (cur.documentType !== "IncomingInvoice") throw new Error("Der Beleg ist keine Eingangsrechnung.");
+    const r = await hqUpload(`/v2/Documents/${c.d.d}/Attachments`, { ...c.api, fields: { Name: name, IsDocumentPdf: true }, file, filename: name });
+    auditWrite({ ...log, status: r.status });
+    res.type("text").send(`Fertig: ${name} hängt jetzt an der Eingangsrechnung. Du kannst dieses Fenster schließen.`);
+  } catch (e) {
+    auditWrite({ ...log, fehler: String(e.message || e).slice(0, 200) });
+    res.status(502).type("text").send("Hochladen fehlgeschlagen. Bitte in Claude einen neuen Link anfordern. " + String(e.message || e).slice(0, 200));
+  }
+});
 
 app.use((_req, res) => res.status(404).end());
 
