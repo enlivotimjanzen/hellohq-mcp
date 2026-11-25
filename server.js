@@ -40,7 +40,7 @@ const {
   ENABLE_WRITE_V2 = "false",
 } = process.env;
 
-const VERSION = "2.7.3";
+const VERSION = "2.8.0";
 
 const LEGACY_ON = Boolean(HELLOHQ_API_TOKEN) && Boolean(MCP_SECRET) && MCP_SECRET.length >= 24;
 const OAUTH_ON =
@@ -497,8 +497,8 @@ const SPECS = {
 
 // v2: Belege nur als Entwurf. Kein Statuswechsel, kein Versand, keine Zahlungen, kein Löschen.
 const DOC_TYPES = ["Quotation", "Confirmation", "Invoice", "AdvancedInvoice", "FinalInvoice"];
-const DOC_NEW = { documentType: DOC_TYPES, companyId: I, contactPersonId: I, projectId: I, leadId: I, documentTemplateEntityId: I, date: DT, validUntilDate: DT, performancePeriodStartDate: DT, performancePeriodEndDate: DT, currency: ["EUR", "CHF", "USD", "GBP"], note: S, paymentConditionId: I, deliveryConditionId: I, internalContactPersonId: I };
-const DOC_EDIT = { date: DT, validUntilDate: DT, performancePeriodStartDate: DT, performancePeriodEndDate: DT, note: S, contactPersonId: I, projectId: I, leadId: I, paymentConditionId: I, deliveryConditionId: I, internalContactPersonId: I };
+const DOC_NEW = { documentType: DOC_TYPES, companyId: I, contactPersonId: I, projectId: I, leadId: I, documentTemplateEntityId: I, date: DT, validUntilDate: DT, performancePeriodStartDate: DT, performancePeriodEndDate: DT, currency: ["EUR", "CHF", "USD", "GBP"], note: TXT, paymentConditionId: I, deliveryConditionId: I, internalContactPersonId: I };
+const DOC_EDIT = { date: DT, validUntilDate: DT, performancePeriodStartDate: DT, performancePeriodEndDate: DT, note: TXT, contactPersonId: I, projectId: I, leadId: I, paymentConditionId: I, deliveryConditionId: I, internalContactPersonId: I };
 const DOC_KEEP = [...Object.keys(DOC_EDIT), "discountNet", "discountPercent", "marginNet", "marginPercent", "taxOption", "currency", "serviceType", "companyPurchaseOrderNumberId", "financesBankAccountId", "companyId"];
 const PROJ_EDIT_V2 = { name: S, startDate: DT, internalContactPersonId: I };
 const CONT_EDIT_V2 = { eMail: S, position: S, phoneLandline: S, phoneMobile: S };
@@ -628,10 +628,21 @@ const SPECS_V2 = {
   // Belege (nur Entwürfe)
   beleg_entwurf_anlegen: { label: "Belegentwurf anlegen", res: "Documents", method: "POST", path: () => "/v2/Documents", fields: DOC_NEW, required: ["documentType", "companyId", "documentTemplateEntityId", "date", "validUntilDate", "performancePeriodStartDate", "performancePeriodEndDate", "currency"], defaults: () => ({ currency: "EUR", date: new Date().toISOString() }), vermerk: true, after: docLinkExtra },
   beleg_entwurf_aendern: { label: "Belegentwurf ändern", res: "Documents", method: "PUT", path: (id) => `/v2/Documents/${id}`, fields: DOC_EDIT, keep: DOC_KEEP, merge: true, needId: true, check: requireDraft, after: docLinkExtra },
-  eingangsrechnung_anlegen: { label: "Eingangsrechnung als Entwurf anlegen", res: "Documents", method: "POST", path: () => "/v2/Documents", fields: { companyId: I, number: S, date: DT, validUntilDate: DT, performancePeriodStartDate: DT, performancePeriodEndDate: DT, currency: ["EUR", "CHF", "USD", "GBP"], note: S, projectId: I, documentTemplateEntityId: I }, required: ["companyId", "date", "documentTemplateEntityId", "validUntilDate", "performancePeriodStartDate", "performancePeriodEndDate", "currency"], defaults: () => ({ documentType: "IncomingInvoice", currency: "EUR" }), guard: incomingGuard, vermerk: true, after: docLinkExtra },
+  eingangsrechnung_anlegen: { label: "Eingangsrechnung als Entwurf anlegen", res: "Documents", method: "POST", path: () => "/v2/Documents", fields: { companyId: I, number: S, date: DT, validUntilDate: DT, performancePeriodStartDate: DT, performancePeriodEndDate: DT, currency: ["EUR", "CHF", "USD", "GBP"], note: TXT, projectId: I, documentTemplateEntityId: I }, required: ["companyId", "date", "documentTemplateEntityId", "validUntilDate", "performancePeriodStartDate", "performancePeriodEndDate", "currency"], defaults: () => ({ documentType: "IncomingInvoice", currency: "EUR" }), guard: incomingGuard, vermerk: true, after: docLinkExtra },
   beleg_aus_beleg: { label: "Neuen Entwurf aus einem Beleg erzeugen (z.B. Angebot zu Rechnung)", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/CreateFromDocument`, fields: { documentType: ["Quotation", "Confirmation", "Invoice", "AdvancedInvoice", "FinalInvoice", "DeliveryNote"] }, required: ["documentType"], needId: true, guard: sourceDocGuard, vermerk: true, after: docLinkExtra },
   beleg_kopieren: { label: "Beleg als neuen Entwurf kopieren", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/Copy`, fields: {}, needId: true, guard: sourceDocGuard, toBody: noBody, vermerk: true, after: docLinkExtra },
   beleg_vorlage_wechseln: { label: "Vorlage eines Entwurfs wechseln", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/ChangeTemplate`, fields: { documentTemplateId: I, replaceOrderedElementsFromTemplate: B }, required: ["documentTemplateId"], needId: true, defaults: () => ({ replaceOrderedElementsFromTemplate: false }), guard: ({ id, api }) => draftDoc(id, api).then((c) => ({ info: { beleg_id: id, vorlage_bisher: c.documentTemplateEntityId } })) },
+  beleg_text_anlegen: { label: "Textblock in einen Entwurf einfügen", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/Text`, fields: { text: TXT, index: I }, required: ["text"], needId: true, guard: ({ id, api }) => draftDoc(id, api).then((c) => ({ info: { beleg_id: id, bloecke: (c.orderedElements || []).map((e) => `${e.index}: ${e.type}`).join(", ") } })) },
+  beleg_text_aendern: { label: "Textblock in einem Entwurf ändern", res: "Documents", method: "PUT", path: (id, _a, _s, d) => {
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(d.elementId || ""))) throw new Error("Feld elementId: id des Textblocks erwartet (aus orderedElements des Belegs).");
+      return `/v2/Documents/${id}/Text/${d.elementId}`;
+    }, fields: { elementId: S, text: TXT, index: I }, required: ["elementId", "text"], needId: true, toBody: ({ elementId, ...rest }) => rest,
+    guard: async ({ id, data, api }) => {
+      const c = await draftDoc(id, api);
+      const el = (c.orderedElements || []).find((e) => e.id === data.elementId);
+      if (!el || el.type !== "Text") throw new Error("Textblock nicht gefunden. Nur Elemente vom Typ Text lassen sich ändern.");
+      return { set: { index: el.index }, info: { beleg_id: id, text_bisher: el.plainText } };
+    } },
   beleg_kommentar: { label: "Kommentar an Beleg", res: "Documents", method: "POST", path: (id) => `/v2/Documents/${id}/Comments`, fields: { message: TXT }, required: ["message"], needId: true, defaults: (s) => ({ userId: s.uid }) },
   // Positionen (Beleg im Entwurf oder geplanter Umsatz)
   position_freitext: { label: "Freitext-Position mit Preis anlegen", res: "DocumentPositions", method: "POST", path: () => "/v2/DocumentPositions/FreeTextPosition", fields: POS_FREE, required: ["documentEntityId", "text", "amount1", "price"], defaults: () => ({ interval: "Once", tax: 19, cost: 0, marginNet: 0, marginPercent: 0, discountNet: 0, discountPercent: 0, isExternal: false, isFactorizable: false, isOptional: false }), guard: positionGuard },
@@ -662,6 +673,44 @@ const SPECS_V2 = {
 const escapeHtml = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 const toHtml = (t) => escapeHtml(t).replace(/\r?\n/g, "<br>");
 
+// Texte für helloHQ: alles wird maskiert, nur eine feste Liste harmloser Formatierungen ohne Attribute bleibt erhalten.
+// Erlaubt: <b> <strong> <i> <em> <u> <ul> <ol> <li> <p> <br>, außerdem **fett** und Zeilen mit "- " oder "• " als Aufzählung.
+function formatText(src) {
+  let t = escapeHtml(String(src).replace(/\r\n?/g, "\n"));
+  t = t.replace(/&lt;(\/?)(b|strong|i|em|u|ul|ol|li|p)&gt;/gi, (_m, c, tag) => `<${c}${tag.toLowerCase()}>`);
+  t = t.replace(/&lt;br\s*\/?&gt;/gi, "<br>");
+  t = t.replace(/\*\*(?=\S)([^*\n]*?\S)\*\*/g, "<b>$1</b>");
+  // Aufzählungen aus Zeilen mit "- " oder "• "
+  const out = [];
+  let list = null;
+  for (const line of t.split("\n")) {
+    const m = line.match(/^\s*(?:-|•)\s+(.*)$/);
+    if (m) {
+      (list ||= []).push(`<li>${m[1]}</li>`);
+      continue;
+    }
+    if (list) out.push(`<ul>${list.join("")}</ul>`), (list = null);
+    out.push(line);
+  }
+  if (list) out.push(`<ul>${list.join("")}</ul>`);
+  // Zeilenumbrüche zu <br>, aber nicht direkt an Block-Elementen
+  t = out.reduce((acc, line, i) => {
+    if (i === 0) return line;
+    const block = /<\/?(ul|ol|li|p)>\s*$/.test(acc) || /^\s*<\/?(ul|ol|li|p)>/.test(line);
+    return acc + (block ? "" : "<br>") + line;
+  }, "");
+  // Offene Tags schließen, verwaiste schließende Tags entfernen
+  const stack = [];
+  t = t.replace(/<(\/?)(b|strong|i|em|u|ul|ol|li|p)>/g, (m, c, tag) => {
+    if (!c) return stack.push(tag), m;
+    const at = stack.lastIndexOf(tag);
+    if (at < 0) return "";
+    const closing = stack.splice(at).reverse().map((x) => `</${x}>`).join("");
+    return closing;
+  });
+  return t + stack.reverse().map((x) => `</${x}>`).join("");
+}
+
 function cleanValue(field, type, v) {
   const bad = (m) => new Error(`Feld "${field}": ${m}`);
   if (Array.isArray(type)) {
@@ -686,7 +735,7 @@ function cleanValue(field, type, v) {
     }
     case TXT:
       if (typeof v !== "string" || v.length > 20000) throw bad("Text bis 20000 Zeichen erwartet");
-      return toHtml(v);
+      return formatText(v);
     case IDS: {
       const ids = String(v).split(",").map((s) => s.trim()).filter(Boolean);
       if (!ids.length || ids.length > 20 || !ids.every((s) => /^\d{1,9}$/.test(s))) throw bad("Nummern mit Komma getrennt erwartet, z.B. \"3,7\"");
@@ -1342,7 +1391,7 @@ function buildOAuthServer(session, role) {
       role,
       hints:
         "Welche Aktionen du hast, hängt von der Rolle ab. Löschen, Festschreiben, Versenden und Statuswechsel von Belegen gehen nicht, das macht ein Mensch in helloHQ. Zeiten werden in awork gebucht, nicht hier. " +
-        "Belege: beleg_entwurf_anlegen braucht documentTemplateEntityId (hellohq_v2_list auf DocumentTemplates), companyId, Leistungszeitraum und validUntilDate. beleg_aus_beleg (id = Quellbeleg, documentType z.B. Invoice) und beleg_kopieren erzeugen neue Entwürfe. Neue Belege bekommen automatisch einen Kommentar mit dem Namen der Person. Ändern, Vorlage wechseln und Positionen gehen nur bei Entwürfen. Das Lieferdatum lässt sich über die Schnittstelle nicht setzen (helloHQ setzt Anlagetag plus 7 Tage). Gib der Person nach dem Anlegen den Link link_hellohq aus der Antwort und sag ihr, dass sie das Lieferdatum dort von Hand ändern muss. " +
+        "Belege: beleg_entwurf_anlegen braucht documentTemplateEntityId (hellohq_v2_list auf DocumentTemplates), companyId, Leistungszeitraum und validUntilDate. beleg_aus_beleg (id = Quellbeleg, documentType z.B. Invoice) und beleg_kopieren erzeugen neue Entwürfe. Neue Belege bekommen automatisch einen Kommentar mit dem Namen der Person. Ändern, Vorlage wechseln, Textblöcke und Positionen gehen nur bei Entwürfen. Formatierung in Texten (Positionen, Textblöcke, Beschreibung, Historie, Kommentare): <b>fett</b> oder **fett**, <i>kursiv</i>, <u>unterstrichen</u>, Aufzählungen als Zeilen mit "- " oder als <ul><li>, Zeilenumbrüche. Andere HTML-Tags werden als Text angezeigt. beleg_text_anlegen fügt einen Textblock ein (index = Position im Beleg, ohne Angabe am Ende), beleg_text_aendern ändert einen vorhandenen Textblock (elementId aus orderedElements des Belegs, hellohq_v2_get auf den Beleg). Das Lieferdatum lässt sich über die Schnittstelle nicht setzen (helloHQ setzt Anlagetag plus 7 Tage). Gib der Person nach dem Anlegen den Link link_hellohq aus der Antwort und sag ihr, dass sie das Lieferdatum dort von Hand ändern muss. " +
         "eingangsrechnung_anlegen: companyId ist der Lieferant, date das Rechnungsdatum, validUntilDate die Fälligkeit (sonst Rechnungsdatum), Leistungszeitraum sonst Rechnungsdatum; die Vorlage wird automatisch gewählt. number NICHT setzen: bei enlivo bleibt die Belegnummer von Eingangsrechnungen leer. Die Rechnungsnummer des Lieferanten gehört in note (Beschreibung), zum Beispiel: Meta Werbeanzeigen Juli 2026 (Rechnung FBADS-516-106305818). number nur, wenn die Person es ausdrücklich verlangt; dann werden doppelte Nummern beim selben Lieferanten abgelehnt. Die Beträge setzt du danach mit position_freitext (price netto, tax Steuersatz) auf die id der neuen Eingangsrechnung. Nimm alle Werte nur aus der Rechnung, die die Person dir gibt. " +
         "Positionen: documentEntityId ist die Belegnummer (id) oder die id eines geplanten Umsatzes; die Tabelle wird automatisch gewählt. position_freitext braucht text, amount1 (Menge), price (netto je Einheit), tax ist 19 wenn nicht angegeben. position_leistung braucht servicePriceId, position_leistungsset serviceSetId (hellohq_v2_list auf Services). position_aendern: id ist die Positionsnummer. " +
         "zahlung_erfassen: id ist die Rechnungsnummer (id), nur versendete Rechnungen, amount höchstens der offene Betrag, typeOfPayment BankAccount (Überweisung), DebitCharge (Lastschrift), CreditCard, Cash oder EarlyPayment (Skonto), paymentDate ist heute wenn nicht angegeben. zahlungsausgang_erfassen genauso für bezahlte Eingangsrechnungen, nur wenn sie angenommen (freigegeben) sind. Nimm Betrag und Datum nur aus Angaben der Person oder einem Kontoauszug, den sie dir gibt. " +
